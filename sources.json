@@ -1,0 +1,23 @@
+{
+  "sources": [
+    {
+      "id": "my-scad-library",
+      "name": "My SCAD Library",
+      "type": "scad",
+      "path": "/path/to/scad/library",
+      "libraryPaths": [
+        "/path/to/openscad/libs"
+      ],
+      "includeHelpers": false,
+      "includeInProgress": false,
+      "includeDeprecated": false
+    },
+    {
+      "id": "my-stl-library",
+      "name": "My STL Library",
+      "type": "stl",
+      "path": "/path/to/stl/folder",
+      "libraryPaths": []
+    }
+  ]
+}

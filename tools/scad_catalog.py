@@ -1,0 +1,2040 @@
+#!/usr/bin/env python3
+"""Build a local searchable catalog for one or more OpenSCAD libraries."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CONFIG_PATH = "sources.json"
+DEFAULT_OUTPUT_DIR = ".catalog"
+HELPER_DIRS = {"Modules"}
+IN_PROGRESS_DIRS = {"InProgress"}
+
+
+@dataclass
+class SourceConfig:
+    id: str
+    name: str
+    source_type: str
+    source_root: Path
+    relative_root: str
+    library_paths: list[Path]
+    include_helpers: bool
+    include_in_progress: bool
+    include_deprecated: bool
+
+
+@dataclass
+class Entry:
+    id: str
+    entry_type: str
+    source_id: str
+    source_name: str
+    source_path: Path
+    relative_path: str
+    category: str
+    title: str
+    parameters: list[dict[str, Any]]
+    library_paths: list[str]
+    tags: list[str]
+    parameter_count: int
+    group_names: list[str]
+    parameter_names: list[str]
+    option_values: list[str]
+    metadata_path: str | None
+    preview_path: str | None
+    metadata_error: str | None
+    preview_error: str | None
+
+    def to_index_record(self) -> dict[str, Any]:
+        search_parts = [
+            self.source_name,
+            self.title,
+            self.relative_path,
+            self.category,
+            *self.tags,
+            *self.group_names,
+            *self.parameter_names,
+            *self.option_values,
+        ]
+        return {
+            "id": self.id,
+            "entryType": self.entry_type,
+            "sourceId": self.source_id,
+            "sourceName": self.source_name,
+            "title": self.title,
+            "relativePath": self.relative_path,
+            "category": self.category,
+            "parameters": self.parameters,
+            "libraryPaths": self.library_paths,
+            "tags": self.tags,
+            "parameterCount": self.parameter_count,
+            "groupNames": self.group_names,
+            "parameterNames": self.parameter_names[:10],
+            "metadataPath": self.metadata_path,
+            "previewPath": self.preview_path,
+            "metadataError": self.metadata_error,
+            "previewError": self.preview_error,
+            "searchText": " ".join(part for part in search_parts if part).lower(),
+        }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a searchable HTML catalog of OpenSCAD models."
+    )
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"JSON config file listing sources to scan (default: {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory to write catalog files into (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "--openscad-bin",
+        default="openscad-nightly",
+        help="OpenSCAD executable to use for metadata and preview export.",
+    )
+    parser.add_argument(
+        "--imgsize",
+        default="512,512",
+        help="Preview PNG size in WIDTH,HEIGHT form (default: 512,512).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only process the first N discovered files.",
+    )
+    parser.add_argument(
+        "--include-helpers",
+        action="store_true",
+        help="Include helper files under Modules/.",
+    )
+    parser.add_argument(
+        "--include-in-progress",
+        action="store_true",
+        help="Include files in InProgress/ directories.",
+    )
+    parser.add_argument(
+        "--include-deprecated",
+        action="store_true",
+        help="Include files whose names contain DEPRECATED.",
+    )
+    parser.add_argument(
+        "--skip-previews",
+        action="store_true",
+        help="Only export metadata and HTML; do not render preview PNGs.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate metadata and previews even if cached files exist.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="Timeout in seconds for each OpenSCAD invocation (default: 180).",
+    )
+    return parser.parse_args()
+
+
+def slugify(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().replace(os.sep, "__"))
+    cleaned = cleaned.strip("-._") or "model"
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}-{digest}"
+
+
+def resolve_config_path(path_text: str, workspace_root: Path) -> Path:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = (workspace_root / path).resolve()
+    return path
+
+
+def resolve_path(path_text: str, workspace_root: Path) -> Path:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = (workspace_root / path).resolve()
+    return path
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path.resolve())
+    return unique
+
+
+def load_sources(args: argparse.Namespace, workspace_root: Path) -> list[SourceConfig]:
+    config_path = resolve_config_path(args.config, workspace_root)
+    if not config_path.exists():
+        raise SystemExit(f"Source config does not exist: {config_path}")
+
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Source config is not valid JSON: {exc}") from exc
+
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise SystemExit("Source config must contain a non-empty 'sources' array.")
+
+    sources: list[SourceConfig] = []
+    for index, raw in enumerate(raw_sources, start=1):
+        if not isinstance(raw, dict):
+            raise SystemExit(f"Source #{index} must be an object.")
+
+        name = raw.get("name") or raw.get("id")
+        path_text = raw.get("path")
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit(f"Source #{index} is missing a valid 'name'.")
+        if not isinstance(path_text, str) or not path_text.strip():
+            raise SystemExit(f"Source '{name}' is missing a valid 'path'.")
+
+        source_root = resolve_path(path_text, workspace_root)
+        if not source_root.exists():
+            raise SystemExit(f"Source '{name}' does not exist: {source_root}")
+        if not source_root.is_dir():
+            raise SystemExit(f"Source '{name}' is not a directory: {source_root}")
+
+        source_type = raw.get("type", "scad")
+        if source_type not in {"scad", "stl"}:
+            raise SystemExit(
+                f"Source '{name}' has unsupported type '{source_type}'. Use 'scad' or 'stl'."
+            )
+
+        source_id = raw.get("id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            source_id = slugify(name)[:40]
+
+        raw_library_paths = raw.get("libraryPaths", [])
+        if raw_library_paths is None:
+            raw_library_paths = []
+        if not isinstance(raw_library_paths, list) or any(
+            not isinstance(item, str) for item in raw_library_paths
+        ):
+            raise SystemExit(f"Source '{name}' has an invalid 'libraryPaths' array.")
+
+        library_paths = dedupe_paths(
+            [resolve_path(item, workspace_root) for item in raw_library_paths]
+        )
+        relative_root = (
+            str(source_root.relative_to(workspace_root))
+            if source_root.is_relative_to(workspace_root)
+            else str(source_root)
+        )
+
+        sources.append(
+            SourceConfig(
+                id=source_id,
+                name=name,
+                source_type=source_type,
+                source_root=source_root,
+                relative_root=relative_root,
+                library_paths=library_paths,
+                include_helpers=bool(raw.get("includeHelpers", args.include_helpers)),
+                include_in_progress=bool(
+                    raw.get("includeInProgress", args.include_in_progress)
+                ),
+                include_deprecated=bool(
+                    raw.get("includeDeprecated", args.include_deprecated)
+                ),
+            )
+        )
+
+    return sources
+
+
+def classify_tags(path: Path) -> list[str]:
+    tags: list[str] = []
+    upper_name = path.name.upper()
+    if any(part in HELPER_DIRS for part in path.parts):
+        tags.append("helper")
+    if any(part in IN_PROGRESS_DIRS or "inprogress" in part.lower() for part in path.parts):
+        tags.append("in-progress")
+    if "DEPRECATED" in upper_name:
+        tags.append("deprecated")
+    return tags
+
+
+def should_include(
+    path: Path,
+    *,
+    include_helpers: bool,
+    include_in_progress: bool,
+    include_deprecated: bool,
+) -> bool:
+    tags = set(classify_tags(path))
+    if "helper" in tags and not include_helpers:
+        return False
+    if "in-progress" in tags and not include_in_progress:
+        return False
+    if "deprecated" in tags and not include_deprecated:
+        return False
+    return True
+
+
+def discover_files(source: SourceConfig, args: argparse.Namespace) -> list[Path]:
+    if source.source_type == "stl":
+        return sorted(source.source_root.rglob("*.stl"))
+    return [
+        path
+        for path in sorted(source.source_root.rglob("*.scad"))
+        if should_include(
+            path.relative_to(source.source_root),
+            include_helpers=source.include_helpers,
+            include_in_progress=source.include_in_progress,
+            include_deprecated=source.include_deprecated,
+        )
+    ]
+
+
+def run_openscad(
+    command: list[str],
+    workspace_root: Path,
+    timeout_seconds: int,
+    library_paths: list[Path],
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    if library_paths:
+        env["OPENSCADPATH"] = os.pathsep.join(str(path) for path in library_paths)
+    return subprocess.run(
+        command,
+        cwd=workspace_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+
+
+def is_cache_valid(output_path: Path, source_path: Path) -> bool:
+    if not output_path.exists():
+        return False
+    return output_path.stat().st_mtime >= source_path.stat().st_mtime
+
+
+def export_metadata(
+    source_path: Path,
+    output_path: Path,
+    openscad_bin: str,
+    workspace_root: Path,
+    force: bool,
+    timeout_seconds: int,
+    library_paths: list[Path],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not force and is_cache_valid(output_path, source_path):
+        try:
+            return json.loads(output_path.read_text(encoding="utf-8")), None
+        except json.JSONDecodeError as exc:
+            return None, f"cached metadata parse error: {exc}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = run_openscad(
+        [
+            openscad_bin,
+            "--export-format",
+            "param",
+            "-o",
+            str(output_path),
+            str(source_path),
+        ],
+        workspace_root,
+        timeout_seconds,
+        library_paths,
+    )
+    if result.returncode != 0:
+        return None, compact_error(result)
+
+    try:
+        return json.loads(output_path.read_text(encoding="utf-8")), None
+    except FileNotFoundError:
+        return None, "metadata file was not created"
+    except json.JSONDecodeError as exc:
+        return None, f"metadata parse error: {exc}"
+
+
+def render_preview(
+    source_path: Path,
+    output_path: Path,
+    openscad_bin: str,
+    workspace_root: Path,
+    imgsize: str,
+    force: bool,
+    timeout_seconds: int,
+    library_paths: list[Path],
+    cache_source_path: Path | None = None,
+) -> str | None:
+    cache_path = cache_source_path or source_path
+    if not force and is_cache_valid(output_path, cache_path):
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = run_openscad(
+        [
+            openscad_bin,
+            "--autocenter",
+            "--viewall",
+            "--imgsize",
+            imgsize,
+            "--backend",
+            "Manifold",
+            "--render=true",
+            "-o",
+            str(output_path),
+            str(source_path),
+        ],
+        workspace_root,
+        timeout_seconds,
+        library_paths,
+    )
+    if result.returncode != 0:
+        return compact_error(result)
+    if not output_path.exists():
+        return "preview file was not created"
+    return None
+
+
+def compact_error(result: subprocess.CompletedProcess[str]) -> str:
+    text = (result.stderr or result.stdout or "").strip()
+    if not text:
+        return f"OpenSCAD failed with exit code {result.returncode}"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(lines[:4])
+
+
+def openscad_string_literal(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def ensure_stl_wrapper(wrapper_path: Path, stl_path: Path) -> None:
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    wrapper_path.write_text(
+        '// Auto-generated for STL preview rendering.\n'
+        f'import("{openscad_string_literal(stl_path.resolve())}");\n',
+        encoding="utf-8",
+    )
+
+
+def build_entry(
+    source_path: Path,
+    source: SourceConfig,
+    output_dir: Path,
+    metadata_dir: Path,
+    preview_dir: Path,
+    args: argparse.Namespace,
+    workspace_root: Path,
+) -> Entry:
+    if source.source_type == "stl":
+        return build_stl_entry(
+            source_path=source_path,
+            source=source,
+            output_dir=output_dir,
+            preview_dir=preview_dir,
+            args=args,
+            workspace_root=workspace_root,
+        )
+
+    return build_scad_entry(
+        source_path=source_path,
+        source=source,
+        output_dir=output_dir,
+        metadata_dir=metadata_dir,
+        preview_dir=preview_dir,
+        args=args,
+        workspace_root=workspace_root,
+    )
+
+
+def build_scad_entry(
+    source_path: Path,
+    source: SourceConfig,
+    output_dir: Path,
+    metadata_dir: Path,
+    preview_dir: Path,
+    args: argparse.Namespace,
+    workspace_root: Path,
+) -> Entry:
+    rel_from_source_root = source_path.relative_to(source.source_root)
+    category = rel_from_source_root.parts[0] if rel_from_source_root.parts else source.name
+    tags = classify_tags(rel_from_source_root)
+    entry_id = slugify(f"{source.id}:{rel_from_source_root.with_suffix('')}")
+    slug = entry_id
+    metadata_file = metadata_dir / f"{slug}.json"
+    preview_file = preview_dir / f"{slug}.png"
+
+    metadata, metadata_error = export_metadata(
+        source_path=source_path,
+        output_path=metadata_file,
+        openscad_bin=args.openscad_bin,
+        workspace_root=workspace_root,
+        force=args.force,
+        timeout_seconds=args.timeout,
+        library_paths=source.library_paths,
+    )
+
+    title = metadata.get("title") if metadata else source_path.stem
+    parameters = metadata.get("parameters", []) if metadata else []
+    group_names = sorted(
+        {param.get("group", "Ungrouped") for param in parameters if isinstance(param, dict)}
+    )
+    parameter_names = [
+        param["name"]
+        for param in parameters
+        if isinstance(param, dict) and isinstance(param.get("name"), str)
+    ]
+    option_values = []
+    for param in parameters:
+        if not isinstance(param, dict):
+            continue
+        for option in param.get("options", []):
+            if isinstance(option, dict):
+                option_name = option.get("name")
+                if isinstance(option_name, str):
+                    option_values.append(option_name)
+
+    preview_error = None
+    if not args.skip_previews:
+        preview_error = render_preview(
+            source_path=source_path,
+            output_path=preview_file,
+            openscad_bin=args.openscad_bin,
+            workspace_root=workspace_root,
+            imgsize=args.imgsize,
+            force=args.force,
+            timeout_seconds=args.timeout,
+            library_paths=source.library_paths,
+        )
+
+    metadata_path = (
+        os.path.relpath(metadata_file, output_dir) if metadata_file.exists() else None
+    )
+    preview_path = (
+        os.path.relpath(preview_file, output_dir) if preview_file.exists() else None
+    )
+
+    return Entry(
+        id=entry_id,
+        entry_type="scad",
+        source_id=source.id,
+        source_name=source.name,
+        source_path=source_path,
+        relative_path=str(rel_from_source_root),
+        category=category,
+        title=title,
+        parameters=parameters,
+        library_paths=[str(path) for path in source.library_paths],
+        tags=tags,
+        parameter_count=len(parameter_names),
+        group_names=group_names,
+        parameter_names=parameter_names,
+        option_values=option_values,
+        metadata_path=metadata_path,
+        preview_path=preview_path,
+        metadata_error=metadata_error,
+        preview_error=preview_error,
+    )
+
+
+def build_stl_entry(
+    source_path: Path,
+    source: SourceConfig,
+    output_dir: Path,
+    preview_dir: Path,
+    args: argparse.Namespace,
+    workspace_root: Path,
+) -> Entry:
+    rel_from_source_root = source_path.relative_to(source.source_root)
+    category = rel_from_source_root.parts[0] if rel_from_source_root.parts else source.name
+    entry_id = slugify(f"{source.id}:{rel_from_source_root.with_suffix('')}")
+    preview_file = preview_dir / f"{entry_id}.png"
+    wrapper_file = output_dir / "wrappers" / f"{entry_id}.scad"
+
+    preview_error = None
+    if not args.skip_previews:
+        ensure_stl_wrapper(wrapper_file, source_path)
+        preview_error = render_preview(
+            source_path=wrapper_file,
+            output_path=preview_file,
+            openscad_bin=args.openscad_bin,
+            workspace_root=workspace_root,
+            imgsize=args.imgsize,
+            force=args.force,
+            timeout_seconds=args.timeout,
+            library_paths=[],
+            cache_source_path=source_path,
+        )
+
+    preview_path = (
+        os.path.relpath(preview_file, output_dir) if preview_file.exists() else None
+    )
+
+    return Entry(
+        id=entry_id,
+        entry_type="stl",
+        source_id=source.id,
+        source_name=source.name,
+        source_path=source_path,
+        relative_path=str(rel_from_source_root),
+        category=category,
+        title=source_path.stem,
+        parameters=[],
+        library_paths=[str(path) for path in source.library_paths],
+        tags=[],
+        parameter_count=0,
+        group_names=[],
+        parameter_names=[],
+        option_values=[],
+        metadata_path=None,
+        preview_path=preview_path,
+        metadata_error=None,
+        preview_error=preview_error,
+    )
+
+
+def write_catalog_json(output_dir: Path, payload: dict[str, Any]) -> None:
+    (output_dir / "catalog.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def html_template(payload: dict[str, Any]) -> str:
+    data_json = json.dumps(payload, separators=(",", ":"))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SCAD Library Catalog</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4efe7;
+      --panel: #fffaf2;
+      --panel-strong: #f2e7d7;
+      --border: #d4c4ae;
+      --text: #1f1d19;
+      --muted: #63594b;
+      --accent: #0d6f63;
+      --accent-2: #c85d2f;
+      --accent-3: #17487a;
+      --shadow: 0 18px 48px rgba(49, 36, 18, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(13, 111, 99, 0.16), transparent 28rem),
+        radial-gradient(circle at top right, rgba(200, 93, 47, 0.14), transparent 24rem),
+        linear-gradient(180deg, #f6f1ea 0%, #efe5d8 100%);
+    }}
+    main {{
+      width: min(1400px, calc(100vw - 2rem));
+      margin: 0 auto;
+      padding: 1.5rem 0 3rem;
+    }}
+    .hero {{
+      background: linear-gradient(135deg, rgba(255,255,255,0.8), rgba(247,236,219,0.92));
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1.25rem;
+      box-shadow: var(--shadow);
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+      backdrop-filter: blur(10px);
+    }}
+    h1 {{
+      margin: 0 0 0.5rem;
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }}
+    .lede {{
+      margin: 0;
+      max-width: 60rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }}
+    .toolbar {{
+      display: grid;
+      grid-template-columns: minmax(14rem, 2fr) minmax(10rem, 1fr) minmax(10rem, 1fr);
+      gap: 0.75rem;
+      margin: 1rem 0 0;
+    }}
+    input, select {{
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 0.9rem;
+      padding: 0.95rem 1rem;
+      font: inherit;
+      background: rgba(255,255,255,0.9);
+      color: var(--text);
+    }}
+    .summary {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      margin: 1rem 0 1.25rem;
+    }}
+    .top-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }}
+    .tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }}
+    .chip {{
+      padding: 0.45rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.75);
+      color: var(--muted);
+      font-size: 0.92rem;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1rem;
+    }}
+    .card {{
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 100%;
+      background: var(--panel);
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1.1rem;
+      box-shadow: var(--shadow);
+    }}
+    .preview {{
+      aspect-ratio: 1 / 1;
+      display: grid;
+      place-items: center;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.2), rgba(0,0,0,0)),
+        linear-gradient(135deg, #ecf5f4 0%, #efe3d4 100%);
+      border-bottom: 1px solid rgba(212, 196, 174, 0.9);
+    }}
+    .preview img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }}
+    .preview-fallback {{
+      padding: 1rem;
+      text-align: center;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .content {{
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      gap: 0.8rem;
+      padding: 1rem;
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--accent);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }}
+    .title {{
+      margin: 0;
+      font-size: 1.25rem;
+      line-height: 1.1;
+    }}
+    .path {{
+      margin: 0;
+      color: var(--muted);
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+      font-size: 0.85rem;
+      word-break: break-word;
+    }}
+    .stats {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }}
+    .tag-list {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+    }}
+    .tag {{
+      padding: 0.28rem 0.55rem;
+      border-radius: 999px;
+      background: var(--panel-strong);
+      color: var(--text);
+      font-size: 0.82rem;
+    }}
+    .issues {{
+      color: var(--accent-2);
+      font-size: 0.88rem;
+      line-height: 1.4;
+    }}
+    .actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: auto;
+      padding-top: 0.2rem;
+    }}
+    button {{
+      border: 1px solid var(--border);
+      border-radius: 0.9rem;
+      padding: 0.8rem 1rem;
+      font: inherit;
+      background: rgba(255,255,255,0.9);
+      color: var(--text);
+      cursor: pointer;
+    }}
+    button.primary {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }}
+    button.secondary {{
+      background: rgba(13, 111, 99, 0.08);
+      border-color: rgba(13, 111, 99, 0.28);
+      color: var(--accent);
+    }}
+    button.ghost {{
+      background: transparent;
+    }}
+    button.tab-active {{
+      background: var(--accent-3);
+      border-color: var(--accent-3);
+      color: white;
+    }}
+    button:disabled {{
+      opacity: 0.55;
+      cursor: not-allowed;
+    }}
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }}
+    a:hover {{
+      text-decoration: underline;
+    }}
+    .empty {{
+      display: none;
+      background: rgba(255,255,255,0.72);
+      border: 1px dashed var(--border);
+      border-radius: 1rem;
+      padding: 1.5rem;
+      color: var(--muted);
+    }}
+    .footer {{
+      margin-top: 1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    dialog {{
+      width: min(1100px, calc(100vw - 1rem));
+      max-width: 1100px;
+      border: none;
+      border-radius: 1.2rem;
+      padding: 0;
+      background: transparent;
+    }}
+    dialog::backdrop {{
+      background: rgba(16, 12, 7, 0.45);
+      backdrop-filter: blur(4px);
+    }}
+    .modal {{
+      display: grid;
+      grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
+      min-height: min(88vh, 900px);
+      overflow: hidden;
+      background: #fcf8f1;
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1.2rem;
+      box-shadow: var(--shadow);
+    }}
+    .modal-pane {{
+      padding: 1rem;
+      overflow: auto;
+    }}
+    .modal-pane.preview-pane {{
+      background:
+        radial-gradient(circle at top left, rgba(13, 111, 99, 0.16), transparent 20rem),
+        linear-gradient(180deg, #f3ece0 0%, #e9dcc8 100%);
+      border-right: 1px solid rgba(212, 196, 174, 0.9);
+    }}
+    .modal-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      margin: 0.75rem 0 0;
+    }}
+    .modal-preview {{
+      display: grid;
+      place-items: center;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1rem;
+      overflow: hidden;
+    }}
+    .modal-preview img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }}
+    .modal-title {{
+      margin: 0.2rem 0 0;
+      font-size: 1.65rem;
+      line-height: 1.02;
+      letter-spacing: -0.03em;
+    }}
+    .modal-subtitle {{
+      margin: 0.35rem 0 0;
+      color: var(--muted);
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+      font-size: 0.88rem;
+      word-break: break-word;
+    }}
+    .server-status {{
+      margin: 0.8rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }}
+    .server-status.online {{
+      color: var(--accent);
+    }}
+    .server-status.offline {{
+      color: var(--accent-2);
+    }}
+    .param-groups {{
+      display: grid;
+      gap: 1rem;
+    }}
+    .group {{
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1rem;
+      padding: 0.9rem;
+      background: rgba(255,255,255,0.7);
+    }}
+    .group h3 {{
+      margin: 0 0 0.65rem;
+      font-size: 1rem;
+    }}
+    .fields {{
+      display: grid;
+      gap: 0.75rem;
+    }}
+    .field {{
+      display: grid;
+      gap: 0.35rem;
+    }}
+    .field label {{
+      font-weight: 600;
+      font-size: 0.94rem;
+    }}
+    .field-help {{
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.35;
+    }}
+    .checkbox-row {{
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      padding: 0.8rem 0.9rem;
+      border: 1px solid var(--border);
+      border-radius: 0.9rem;
+      background: rgba(255,255,255,0.85);
+    }}
+    .checkbox-row input {{
+      width: auto;
+      margin: 0;
+    }}
+    .command-box {{
+      margin: 0;
+      padding: 0.9rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1rem;
+      background: #1f241f;
+      color: #f4f1e7;
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }}
+    .status-box {{
+      min-height: 1.5rem;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }}
+    .status-box.error {{
+      color: var(--accent-2);
+    }}
+    .status-box.success {{
+      color: var(--accent-3);
+    }}
+    .settings-list {{
+      display: grid;
+      gap: 1rem;
+    }}
+    .settings-card {{
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1rem;
+      padding: 1rem;
+      background: rgba(255,255,255,0.74);
+    }}
+    .settings-card h3 {{
+      margin: 0 0 0.75rem;
+      font-size: 1rem;
+    }}
+    .settings-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }}
+    .small-note {{
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }}
+    @media (max-width: 720px) {{
+      .toolbar {{
+        grid-template-columns: 1fr;
+      }}
+      dialog {{
+        width: calc(100vw - 0.5rem);
+      }}
+      .modal {{
+        grid-template-columns: 1fr;
+      }}
+      .modal-pane.preview-pane {{
+        border-right: none;
+        border-bottom: 1px solid rgba(212, 196, 174, 0.9);
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>SCAD Library Catalog</h1>
+      <p class="lede">
+        Search one or more local OpenSCAD libraries by source, folder, parameter group, parameter name,
+        and option label. Point it at your own folders, Git clones, or any mix you want.
+      </p>
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Search: bin, shelf, hook, Multiconnect, Board_Width, GOEWS...">
+        <select id="source">
+          <option value="">All sources</option>
+        </select>
+        <select id="category">
+          <option value="">All categories</option>
+        </select>
+      </div>
+      <div class="summary" id="summary"></div>
+    </section>
+    <div class="top-actions">
+      <button class="secondary" id="rescan-btn" type="button">Rescan Libraries</button>
+      <button class="secondary" id="settings-btn" type="button">Configure Folders</button>
+    </div>
+    <div class="tabs">
+      <button class="secondary tab-active" id="tab-scad-btn" type="button">Customizable SCAD</button>
+      <button class="secondary" id="tab-stl-btn" type="button">Baked STL</button>
+    </div>
+    <section class="grid" id="grid"></section>
+    <section class="empty" id="empty">
+      No models matched the current filter. Try a broader term, or add more source folders from
+      the configuration dialog.
+    </section>
+    <p class="footer" id="footer"></p>
+  </main>
+  <dialog id="customizer">
+    <div class="modal">
+      <section class="modal-pane preview-pane">
+        <div class="eyebrow" id="modal-category"></div>
+        <h2 class="modal-title" id="modal-title"></h2>
+        <p class="modal-subtitle" id="modal-path"></p>
+        <div class="modal-preview" id="modal-preview"></div>
+        <div class="server-status" id="server-status"></div>
+        <div class="modal-toolbar">
+          <button class="primary" id="render-preview-btn" type="button">Render Preview</button>
+          <button class="secondary" id="export-stl-btn" type="button">Export Binary STL</button>
+          <button class="secondary" id="open-scad-btn" type="button">Open In OpenSCAD</button>
+          <button class="ghost" id="copy-command-btn" type="button">Copy Command</button>
+          <button class="ghost" id="reset-params-btn" type="button">Reset</button>
+          <button class="ghost" id="close-modal-btn" type="button">Close</button>
+        </div>
+      </section>
+      <section class="modal-pane">
+        <div class="status-box" id="action-status"></div>
+        <div class="param-groups" id="param-groups"></div>
+        <h3>OpenSCAD Command</h3>
+        <pre class="command-box" id="command-box"></pre>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="settings-dialog">
+    <div class="modal">
+      <section class="modal-pane preview-pane">
+        <div class="eyebrow">Library Config</div>
+        <h2 class="modal-title">Configure Folders</h2>
+        <p class="small-note" id="config-path-note"></p>
+        <div class="status-box" id="settings-status"></div>
+        <div class="settings-actions">
+          <button class="primary" id="save-settings-btn" type="button">Save Sources</button>
+          <button class="secondary" id="save-rescan-btn" type="button">Save And Rescan</button>
+          <button class="ghost" id="add-source-btn" type="button">Add Source</button>
+          <button class="ghost" id="close-settings-btn" type="button">Close</button>
+        </div>
+      </section>
+      <section class="modal-pane">
+        <div class="settings-list" id="settings-list"></div>
+      </section>
+    </div>
+  </dialog>
+  <script id="catalog-data" type="application/json">{data_json}</script>
+  <script>
+    const payload = JSON.parse(document.getElementById("catalog-data").textContent);
+    const entries = payload.entries;
+    const searchInput = document.getElementById("search");
+    const sourceSelect = document.getElementById("source");
+    const categorySelect = document.getElementById("category");
+    const grid = document.getElementById("grid");
+    const summary = document.getElementById("summary");
+    const empty = document.getElementById("empty");
+    const footer = document.getElementById("footer");
+    const customizer = document.getElementById("customizer");
+    const settingsDialog = document.getElementById("settings-dialog");
+    const modalCategory = document.getElementById("modal-category");
+    const modalTitle = document.getElementById("modal-title");
+    const modalPath = document.getElementById("modal-path");
+    const modalPreview = document.getElementById("modal-preview");
+    const paramGroups = document.getElementById("param-groups");
+    const commandBox = document.getElementById("command-box");
+    const actionStatus = document.getElementById("action-status");
+    const serverStatus = document.getElementById("server-status");
+    const renderPreviewBtn = document.getElementById("render-preview-btn");
+    const exportStlBtn = document.getElementById("export-stl-btn");
+    const openScadBtn = document.getElementById("open-scad-btn");
+    const copyCommandBtn = document.getElementById("copy-command-btn");
+    const resetParamsBtn = document.getElementById("reset-params-btn");
+    const closeModalBtn = document.getElementById("close-modal-btn");
+    const rescanBtn = document.getElementById("rescan-btn");
+    const settingsBtn = document.getElementById("settings-btn");
+    const saveSettingsBtn = document.getElementById("save-settings-btn");
+    const saveRescanBtn = document.getElementById("save-rescan-btn");
+    const addSourceBtn = document.getElementById("add-source-btn");
+    const closeSettingsBtn = document.getElementById("close-settings-btn");
+    const settingsList = document.getElementById("settings-list");
+    const settingsStatus = document.getElementById("settings-status");
+    const configPathNote = document.getElementById("config-path-note");
+    const tabScadBtn = document.getElementById("tab-scad-btn");
+    const tabStlBtn = document.getElementById("tab-stl-btn");
+
+    let currentEntry = null;
+    let currentValues = {{}};
+    let serverAvailable = false;
+    let editableConfig = null;
+    let configPath = "";
+    let activeTab = "scad";
+
+    const sourceNames = [...new Set(entries.map((entry) => entry.sourceName))].sort();
+    for (const sourceName of sourceNames) {{
+      const option = document.createElement("option");
+      option.value = sourceName;
+      option.textContent = sourceName;
+      sourceSelect.appendChild(option);
+    }}
+
+    const categories = [...new Set(entries.map((entry) => entry.category))].sort();
+    for (const category of categories) {{
+      const option = document.createElement("option");
+      option.value = category;
+      option.textContent = category;
+      categorySelect.appendChild(option);
+    }}
+
+    function renderSummary(filtered) {{
+      const previewCount = filtered.filter((entry) => entry.previewPath).length;
+      const errorCount = filtered.filter((entry) => entry.metadataError || entry.previewError).length;
+      const scadCount = entries.filter((entry) => entry.entryType === "scad").length;
+      const stlCount = entries.filter((entry) => entry.entryType === "stl").length;
+      summary.innerHTML = "";
+      const chips = [
+        activeTab === "scad" ? "Customizable SCAD" : "Baked STL",
+        `${{filtered.length}} shown`,
+        `${{entries.length}} indexed`,
+        `${{sourceNames.length}} sources`,
+        `${{scadCount}} scad`,
+        `${{stlCount}} stl`,
+        `${{previewCount}} with previews`,
+        `${{errorCount}} with export issues`,
+      ];
+      for (const label of chips) {{
+        const span = document.createElement("span");
+        span.className = "chip";
+        span.textContent = label;
+        summary.appendChild(span);
+      }}
+    }}
+
+    function makeTag(text) {{
+      const span = document.createElement("span");
+      span.className = "tag";
+      span.textContent = text;
+      return span;
+    }}
+
+    function makeCard(entry) {{
+      const card = document.createElement("article");
+      card.className = "card";
+
+      const preview = document.createElement("div");
+      preview.className = "preview";
+      if (entry.previewPath) {{
+        const img = document.createElement("img");
+        img.src = entry.previewPath;
+        img.alt = `${{entry.title}} preview`;
+        preview.appendChild(img);
+      }} else {{
+        const fallback = document.createElement("div");
+        fallback.className = "preview-fallback";
+        fallback.textContent = entry.previewError || "No preview generated.";
+        preview.appendChild(fallback);
+      }}
+      card.appendChild(preview);
+
+      const content = document.createElement("div");
+      content.className = "content";
+
+      const eyebrow = document.createElement("div");
+      eyebrow.className = "eyebrow";
+      eyebrow.textContent = `${{entry.sourceName}} / ${{entry.category}}`;
+      content.appendChild(eyebrow);
+
+      const title = document.createElement("h2");
+      title.className = "title";
+      title.textContent = entry.title;
+      content.appendChild(title);
+
+      const path = document.createElement("p");
+      path.className = "path";
+      path.textContent = entry.relativePath;
+      content.appendChild(path);
+
+      const stats = document.createElement("div");
+      stats.className = "stats";
+      stats.appendChild(makeTag(`${{entry.parameterCount}} parameters`));
+      stats.appendChild(makeTag(`${{entry.groupNames.length}} groups`));
+      content.appendChild(stats);
+
+      const tags = document.createElement("div");
+      tags.className = "tag-list";
+      const visibleTags = [...entry.tags, ...entry.groupNames.slice(0, 4)];
+      for (const tag of visibleTags) {{
+        tags.appendChild(makeTag(tag));
+      }}
+      if (entry.parameterNames.length) {{
+        tags.appendChild(makeTag(`e.g. ${{entry.parameterNames.slice(0, 3).join(", ")}}`));
+      }}
+      content.appendChild(tags);
+
+      if (entry.metadataError || entry.previewError) {{
+        const issues = document.createElement("div");
+        issues.className = "issues";
+        const messages = [entry.metadataError, entry.previewError].filter(Boolean);
+        issues.textContent = messages.join(" | ");
+        content.appendChild(issues);
+      }}
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      const sourceLink = document.createElement("a");
+      sourceLink.href = `${{payload.serverBasePath}}/source-file/${{entry.id}}`;
+      sourceLink.textContent = entry.entryType === "scad" ? "Open source" : "Download STL";
+      actions.appendChild(sourceLink);
+
+      if (entry.entryType === "scad") {{
+        const customizeButton = document.createElement("button");
+        customizeButton.className = "secondary";
+        customizeButton.type = "button";
+        customizeButton.textContent = "Customize";
+        customizeButton.addEventListener("click", () => openCustomizer(entry));
+        actions.appendChild(customizeButton);
+      }} else {{
+        const slicerButton = document.createElement("button");
+        slicerButton.className = "secondary";
+        slicerButton.type = "button";
+        slicerButton.textContent = "Open In Slicer";
+        slicerButton.disabled = !serverAvailable;
+        slicerButton.addEventListener("click", () => openStlInSlicer(entry));
+        actions.appendChild(slicerButton);
+      }}
+
+      if (entry.metadataPath) {{
+        const metadataLink = document.createElement("a");
+        metadataLink.href = entry.metadataPath;
+        metadataLink.textContent = "Customizer JSON";
+        actions.appendChild(metadataLink);
+      }}
+
+      content.appendChild(actions);
+      card.appendChild(content);
+      return card;
+    }}
+
+    function applyFilters() {{
+      const needle = searchInput.value.trim().toLowerCase();
+      const source = sourceSelect.value;
+      const category = categorySelect.value;
+      const filtered = entries.filter((entry) => {{
+        if (entry.entryType !== activeTab) {{
+          return false;
+        }}
+        if (source && entry.sourceName !== source) {{
+          return false;
+        }}
+        if (category && entry.category !== category) {{
+          return false;
+        }}
+        if (!needle) {{
+          return true;
+        }}
+        return entry.searchText.includes(needle);
+      }});
+
+      grid.innerHTML = "";
+      for (const entry of filtered) {{
+        grid.appendChild(makeCard(entry));
+      }}
+
+      empty.style.display = filtered.length ? "none" : "block";
+      renderSummary(filtered);
+    }}
+
+    function shellQuote(text) {{
+      return `'${{String(text).replace(/'/g, `'\"'\"'`)}}'`;
+    }}
+
+    function openscadLiteral(value) {{
+      if (typeof value === "boolean") {{
+        return value ? "true" : "false";
+      }}
+      if (typeof value === "number") {{
+        return Number.isInteger(value) ? String(value) : String(value);
+      }}
+      return JSON.stringify(String(value));
+    }}
+
+    function readInitialValue(parameter) {{
+      if (Object.prototype.hasOwnProperty.call(parameter, "initial")) {{
+        return parameter.initial;
+      }}
+      if (parameter.type === "boolean") {{
+        return false;
+      }}
+      return "";
+    }}
+
+    function cloneInitialValues(parameters) {{
+      const values = {{}};
+      for (const parameter of parameters) {{
+        values[parameter.name] = readInitialValue(parameter);
+      }}
+      return values;
+    }}
+
+    function groupedParameters(parameters) {{
+      const groups = new Map();
+      for (const parameter of parameters) {{
+        const groupName = parameter.group || "Ungrouped";
+        if (!groups.has(groupName)) {{
+          groups.set(groupName, []);
+        }}
+        groups.get(groupName).push(parameter);
+      }}
+      return groups;
+    }}
+
+    function renderPreviewImage(src, alt) {{
+      modalPreview.innerHTML = "";
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = alt;
+      modalPreview.appendChild(img);
+    }}
+
+    function updateStatus(message = "", tone = "") {{
+      actionStatus.textContent = message;
+      actionStatus.className = tone ? `status-box ${{tone}}` : "status-box";
+    }}
+
+    function refreshCommandBox() {{
+      if (!currentEntry) {{
+        commandBox.textContent = "";
+        return;
+      }}
+      const outputStem =
+        `${{currentEntry.sourceName}}-${{currentEntry.title}}`.replace(/[^A-Za-z0-9._-]+/g, "-") || "model";
+      const outputName = `${{outputStem}}.stl`;
+      const outputPath = `${{payload.catalogDir}}/custom/stl/${{outputName}}`;
+      const openScadPath = currentEntry.libraryPaths.length
+        ? currentEntry.libraryPaths.join(payload.pathSeparator)
+        : payload.workspaceRoot;
+      const defs = currentEntry.parameters.map((parameter) => {{
+        const literal = openscadLiteral(currentValues[parameter.name]);
+        return `-D ${{shellQuote(`${{parameter.name}}=${{literal}}`)}}`;
+      }});
+      commandBox.textContent = [
+        `OPENSCADPATH=${{shellQuote(openScadPath)}}`,
+        `${{shellQuote(payload.openscadBin)}} --export-format binstl -o ${{shellQuote(outputPath)}}`,
+        ...defs,
+        shellQuote(currentEntry.absoluteSourcePath),
+      ].join(" ");
+    }}
+
+    function makeInput(parameter) {{
+      if (parameter.type === "boolean") {{
+        const wrapper = document.createElement("label");
+        wrapper.className = "checkbox-row";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = Boolean(currentValues[parameter.name]);
+        input.addEventListener("change", () => {{
+          currentValues[parameter.name] = input.checked;
+          refreshCommandBox();
+        }});
+        const text = document.createElement("span");
+        text.textContent = parameter.name;
+        wrapper.appendChild(input);
+        wrapper.appendChild(text);
+        return wrapper;
+      }}
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "field";
+
+      const label = document.createElement("label");
+      label.textContent = parameter.name;
+      wrapper.appendChild(label);
+
+      let input;
+      if (parameter.options && parameter.options.length) {{
+        input = document.createElement("select");
+        for (const option of parameter.options) {{
+          const opt = document.createElement("option");
+          opt.value = String(option.value);
+          opt.textContent = option.name;
+          if (String(currentValues[parameter.name]) === String(option.value)) {{
+            opt.selected = true;
+          }}
+          input.appendChild(opt);
+        }}
+      }} else {{
+        input = document.createElement("input");
+        input.type = parameter.type === "number" ? "number" : "text";
+        if (parameter.type === "number") {{
+          input.step = parameter.step || "any";
+        }}
+        input.value = String(currentValues[parameter.name] ?? "");
+      }}
+
+      input.addEventListener("input", () => {{
+        if (parameter.type === "number") {{
+          currentValues[parameter.name] = input.value === "" ? "" : Number(input.value);
+        }} else {{
+          currentValues[parameter.name] = input.value;
+        }}
+        refreshCommandBox();
+      }});
+      input.addEventListener("change", () => {{
+        if (parameter.type === "number") {{
+          currentValues[parameter.name] = input.value === "" ? "" : Number(input.value);
+        }} else {{
+          currentValues[parameter.name] = input.value;
+        }}
+        refreshCommandBox();
+      }});
+
+      wrapper.appendChild(input);
+      if (parameter.caption) {{
+        const help = document.createElement("div");
+        help.className = "field-help";
+        help.textContent = parameter.caption;
+        wrapper.appendChild(help);
+      }}
+      return wrapper;
+    }}
+
+    function renderParameterGroups() {{
+      paramGroups.innerHTML = "";
+      const groups = groupedParameters(currentEntry.parameters);
+      for (const [groupName, parameters] of groups.entries()) {{
+        const section = document.createElement("section");
+        section.className = "group";
+        const heading = document.createElement("h3");
+        heading.textContent = groupName;
+        section.appendChild(heading);
+
+        const fields = document.createElement("div");
+        fields.className = "fields";
+        for (const parameter of parameters) {{
+          fields.appendChild(makeInput(parameter));
+        }}
+        section.appendChild(fields);
+        paramGroups.appendChild(section);
+      }}
+    }}
+
+    function updateServerStatus() {{
+      serverStatus.className = serverAvailable ? "server-status online" : "server-status offline";
+      serverStatus.textContent = serverAvailable
+        ? "Local server detected. Preview render, STL export, OpenSCAD launch, and rescans are enabled."
+        : "Open this catalog through the local server to render custom previews, export STL files, launch OpenSCAD, or rescan libraries. Copy Command still works offline.";
+      renderPreviewBtn.disabled = !serverAvailable;
+      exportStlBtn.disabled = !serverAvailable;
+      openScadBtn.disabled = !serverAvailable;
+      rescanBtn.disabled = !serverAvailable;
+      settingsBtn.disabled = !serverAvailable;
+    }}
+
+    function setActiveTab(tab) {{
+      activeTab = tab;
+      tabScadBtn.classList.toggle("tab-active", tab === "scad");
+      tabStlBtn.classList.toggle("tab-active", tab === "stl");
+      applyFilters();
+    }}
+
+    function openCustomizer(entry) {{
+      currentEntry = entry;
+      currentValues = cloneInitialValues(entry.parameters);
+      modalCategory.textContent = `${{entry.sourceName}} / ${{entry.category}}`;
+      modalTitle.textContent = entry.title;
+      modalPath.textContent = entry.relativePath;
+      renderPreviewImage(entry.previewPath || "", `${{entry.title}} preview`);
+      renderParameterGroups();
+      refreshCommandBox();
+      updateStatus("");
+      updateServerStatus();
+      customizer.showModal();
+    }}
+
+    async function postJson(url, payload) {{
+      const response = await fetch(url, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload),
+      }});
+      const data = await response.json();
+      if (!response.ok || !data.ok) {{
+        throw new Error(data.error || `Request failed with ${{response.status}}`);
+      }}
+      return data;
+    }}
+
+    async function detectServer() {{
+      try {{
+        const response = await fetch(`${{payload.serverBasePath}}/health`);
+        if (!response.ok) {{
+          throw new Error("offline");
+        }}
+        const data = await response.json();
+        serverAvailable = Boolean(data.ok);
+      }} catch (_error) {{
+        serverAvailable = false;
+      }}
+      updateServerStatus();
+    }}
+
+    async function renderCustomPreview() {{
+      if (!currentEntry || !serverAvailable) {{
+        return;
+      }}
+      updateStatus("Rendering preview...", "");
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/render-preview`, {{
+          entryId: currentEntry.id,
+          parameters: currentValues,
+        }});
+        renderPreviewImage(data.artifactPath, `${{currentEntry.title}} custom preview`);
+        updateStatus(`Preview written to ${{data.artifactPath}}`, "success");
+      }} catch (error) {{
+        updateStatus(error.message, "error");
+      }}
+    }}
+
+    async function exportBinaryStl() {{
+      if (!currentEntry || !serverAvailable) {{
+        return;
+      }}
+      updateStatus("Exporting binary STL...", "");
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/export-stl`, {{
+          entryId: currentEntry.id,
+          parameters: currentValues,
+        }});
+        if (data.launchedSlicer) {{
+          updateStatus(`Binary STL written to ${{data.artifactPath}} and opened in OrcaSlicer.`, "success");
+        }} else if (data.artifactPath) {{
+          updateStatus(
+            data.slicerError
+              ? `Binary STL written to ${{data.artifactPath}}. OrcaSlicer was not launched: ${{data.slicerError}}`
+              : `Binary STL written to ${{data.artifactPath}}`,
+            data.slicerError ? "error" : "success"
+          );
+          window.open(data.artifactPath, "_blank", "noopener");
+        }}
+      }} catch (error) {{
+        updateStatus(error.message, "error");
+      }}
+    }}
+
+    async function openInOpenScad() {{
+      if (!currentEntry || !serverAvailable) {{
+        return;
+      }}
+      updateStatus("Launching OpenSCAD...", "");
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/open-scad`, {{
+          entryId: currentEntry.id,
+          parameters: currentValues,
+        }});
+        updateStatus(`Opened ${{data.openedPath}} in OpenSCAD.`, "success");
+      }} catch (error) {{
+        updateStatus(error.message, "error");
+      }}
+    }}
+
+    async function openStlInSlicer(entry) {{
+      if (!serverAvailable) {{
+        return;
+      }}
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/open-in-slicer`, {{
+          entryId: entry.id,
+          parameters: {{}},
+        }});
+        updateStatus(`Opened ${{data.openedPath}} in the slicer.`, "success");
+      }} catch (error) {{
+        updateStatus(error.message, "error");
+      }}
+    }}
+
+    async function copyCommand() {{
+      try {{
+        await navigator.clipboard.writeText(commandBox.textContent);
+        updateStatus("OpenSCAD command copied to clipboard.", "success");
+      }} catch (_error) {{
+        updateStatus("Clipboard copy failed. Copy the command manually from the box below.", "error");
+      }}
+    }}
+
+    function updateSettingsStatus(message = "", tone = "") {{
+      settingsStatus.textContent = message;
+      settingsStatus.className = tone ? `status-box ${{tone}}` : "status-box";
+    }}
+
+    function blankSource() {{
+      return {{
+        id: "",
+        name: "",
+        type: "scad",
+        path: "",
+        libraryPaths: [],
+        includeHelpers: false,
+        includeInProgress: false,
+        includeDeprecated: false,
+      }};
+    }}
+
+    function splitPaths(text) {{
+      return text
+        .split(/\\n|,/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }}
+
+    function renderSettingsList() {{
+      settingsList.innerHTML = "";
+      const sources = editableConfig?.sources || [];
+      sources.forEach((source, index) => {{
+        const card = document.createElement("section");
+        card.className = "settings-card";
+
+        const heading = document.createElement("h3");
+        heading.textContent = source.name || `Source ${{index + 1}}`;
+        card.appendChild(heading);
+
+        const fields = document.createElement("div");
+        fields.className = "fields";
+
+        const definitions = [
+          ["id", "Source ID", "text", source.id || ""],
+          ["name", "Display Name", "text", source.name || ""],
+          ["path", "Folder Path", "text", source.path || ""],
+          ["libraryPaths", "Library Paths", "text", (source.libraryPaths || []).join(", ")],
+        ];
+
+        const typeField = document.createElement("div");
+        typeField.className = "field";
+        const typeLabel = document.createElement("label");
+        typeLabel.textContent = "Source Type";
+        typeField.appendChild(typeLabel);
+        const typeSelect = document.createElement("select");
+        for (const optionValue of ["scad", "stl"]) {{
+          const option = document.createElement("option");
+          option.value = optionValue;
+          option.textContent = optionValue === "scad" ? "Customizable SCAD" : "Baked STL";
+          option.selected = (source.type || "scad") === optionValue;
+          typeSelect.appendChild(option);
+        }}
+        typeSelect.addEventListener("change", () => {{
+          source.type = typeSelect.value;
+        }});
+        typeField.appendChild(typeSelect);
+        fields.appendChild(typeField);
+
+        for (const [key, labelText, type, value] of definitions) {{
+          const field = document.createElement("div");
+          field.className = "field";
+          const label = document.createElement("label");
+          label.textContent = labelText;
+          field.appendChild(label);
+          const input = document.createElement("input");
+          input.type = type;
+          input.value = value;
+          input.addEventListener("input", () => {{
+            if (key === "libraryPaths") {{
+              source[key] = splitPaths(input.value);
+            }} else {{
+              source[key] = input.value;
+            }}
+            if (key === "name") {{
+              heading.textContent = input.value || `Source ${{index + 1}}`;
+            }}
+          }});
+          field.appendChild(input);
+          if (key === "libraryPaths") {{
+            const help = document.createElement("div");
+            help.className = "field-help";
+            help.textContent = "Comma-separated or newline-separated paths added to OPENSCADPATH for this source.";
+            field.appendChild(help);
+          }}
+          fields.appendChild(field);
+        }}
+
+        const toggles = [
+          ["includeHelpers", "Include helper files"],
+          ["includeInProgress", "Include in-progress files"],
+          ["includeDeprecated", "Include deprecated files"],
+        ];
+        for (const [key, labelText] of toggles) {{
+          const wrapper = document.createElement("label");
+          wrapper.className = "checkbox-row";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = Boolean(source[key]);
+          input.addEventListener("change", () => {{
+            source[key] = input.checked;
+          }});
+          const span = document.createElement("span");
+          span.textContent = labelText;
+          wrapper.appendChild(input);
+          wrapper.appendChild(span);
+          fields.appendChild(wrapper);
+        }}
+
+        card.appendChild(fields);
+
+        const actions = document.createElement("div");
+        actions.className = "settings-actions";
+        const removeBtn = document.createElement("button");
+        removeBtn.className = "ghost";
+        removeBtn.type = "button";
+        removeBtn.textContent = "Remove Source";
+        removeBtn.addEventListener("click", () => {{
+          editableConfig.sources.splice(index, 1);
+          renderSettingsList();
+        }});
+        actions.appendChild(removeBtn);
+        card.appendChild(actions);
+
+        settingsList.appendChild(card);
+      }});
+    }}
+
+    async function loadConfig() {{
+      const response = await fetch(`${{payload.serverBasePath}}/config`);
+      const data = await response.json();
+      if (!response.ok || !data.ok) {{
+        throw new Error(data.error || "Failed to load config");
+      }}
+      editableConfig = structuredClone(data.config);
+      configPath = data.configPath;
+      configPathNote.textContent = `Editing ${{configPath}}`;
+      renderSettingsList();
+    }}
+
+    async function openSettings() {{
+      if (!serverAvailable) {{
+        return;
+      }}
+      updateSettingsStatus("Loading source configuration...", "");
+      try {{
+        await loadConfig();
+        updateSettingsStatus("", "");
+        settingsDialog.showModal();
+      }} catch (error) {{
+        updateSettingsStatus(error.message, "error");
+        settingsDialog.showModal();
+      }}
+    }}
+
+    async function saveConfig() {{
+      if (!editableConfig) {{
+        return;
+      }}
+      updateSettingsStatus("Saving source configuration...", "");
+      const data = await postJson(`${{payload.serverBasePath}}/config`, {{
+        config: editableConfig,
+      }});
+      updateSettingsStatus(`Saved ${{data.configPath}}.`, "success");
+      return data;
+    }}
+
+    async function triggerRescan() {{
+      updateSettingsStatus("Rescanning libraries...", "");
+      const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{}});
+      updateSettingsStatus(
+        `Rescan complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
+        "success"
+      );
+      window.setTimeout(() => window.location.reload(), 600);
+      return data;
+    }}
+
+    async function rescanOnly() {{
+      if (!serverAvailable) {{
+        return;
+      }}
+      updateStatus("Rescanning libraries...", "");
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{}});
+        updateStatus(
+          `Rescan complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
+          "success"
+        );
+        window.setTimeout(() => window.location.reload(), 600);
+      }} catch (error) {{
+        updateStatus(error.message, "error");
+      }}
+    }}
+
+    searchInput.addEventListener("input", applyFilters);
+    sourceSelect.addEventListener("change", applyFilters);
+    categorySelect.addEventListener("change", applyFilters);
+    tabScadBtn.addEventListener("click", () => setActiveTab("scad"));
+    tabStlBtn.addEventListener("click", () => setActiveTab("stl"));
+    renderPreviewBtn.addEventListener("click", renderCustomPreview);
+    exportStlBtn.addEventListener("click", exportBinaryStl);
+    openScadBtn.addEventListener("click", openInOpenScad);
+    copyCommandBtn.addEventListener("click", copyCommand);
+    rescanBtn.addEventListener("click", rescanOnly);
+    settingsBtn.addEventListener("click", openSettings);
+    addSourceBtn.addEventListener("click", () => {{
+      if (!editableConfig) {{
+        editableConfig = {{ sources: [] }};
+      }}
+      editableConfig.sources.push(blankSource());
+      renderSettingsList();
+    }});
+    saveSettingsBtn.addEventListener("click", async () => {{
+      try {{
+        await saveConfig();
+      }} catch (error) {{
+        updateSettingsStatus(error.message, "error");
+      }}
+    }});
+    saveRescanBtn.addEventListener("click", async () => {{
+      try {{
+        await saveConfig();
+        await triggerRescan();
+      }} catch (error) {{
+        updateSettingsStatus(error.message, "error");
+      }}
+    }});
+    closeSettingsBtn.addEventListener("click", () => settingsDialog.close());
+    resetParamsBtn.addEventListener("click", () => {{
+      if (!currentEntry) {{
+        return;
+      }}
+      currentValues = cloneInitialValues(currentEntry.parameters);
+      renderParameterGroups();
+      refreshCommandBox();
+      updateStatus("Parameters reset to OpenSCAD defaults.", "");
+    }});
+    closeModalBtn.addEventListener("click", () => customizer.close());
+    customizer.addEventListener("click", (event) => {{
+      const rect = customizer.getBoundingClientRect();
+      const withinDialog =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (!withinDialog) {{
+        customizer.close();
+      }}
+    }});
+    settingsDialog.addEventListener("click", (event) => {{
+      const rect = settingsDialog.getBoundingClientRect();
+      const withinDialog =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (!withinDialog) {{
+        settingsDialog.close();
+      }}
+    }});
+
+    footer.textContent =
+      `Generated ${{payload.generatedAt}} using ${{payload.openscadBin}} across ${{payload.sources.length}} configured source libraries. ` +
+      `Run the local server for custom preview renders and binary STL exports.`;
+
+    setActiveTab("scad");
+    detectServer();
+  </script>
+</body>
+</html>
+"""
+
+
+def write_catalog_html(output_dir: Path, payload: dict[str, Any]) -> None:
+    (output_dir / "index.html").write_text(html_template(payload), encoding="utf-8")
+
+
+def build_payload(
+    entries: list[Entry],
+    args: argparse.Namespace,
+    sources: list[SourceConfig],
+    workspace_root: Path,
+) -> dict[str, Any]:
+    index_records = []
+    for entry in entries:
+        record = entry.to_index_record()
+        record["sourcePath"] = str(entry.source_path)
+        record["absoluteSourcePath"] = str(entry.source_path)
+        index_records.append(record)
+
+    return {
+        "generatedAt": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "openscadBin": args.openscad_bin,
+        "workspaceRoot": str(workspace_root),
+        "catalogDir": args.output_dir,
+        "pathSeparator": os.pathsep,
+        "serverBasePath": "/api",
+        "sources": [
+            {
+                "id": source.id,
+                "name": source.name,
+                "type": source.source_type,
+                "path": str(source.source_root),
+                "relativeRoot": source.relative_root,
+                "libraryPaths": [str(path) for path in source.library_paths],
+            }
+            for source in sources
+        ],
+        "entries": index_records,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    workspace_root = Path.cwd().resolve()
+    output_dir = (workspace_root / args.output_dir).resolve()
+    sources = load_sources(args, workspace_root)
+
+    metadata_dir = output_dir / "metadata"
+    preview_dir = output_dir / "previews"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_file_pairs = [
+        (source, source_path)
+        for source in sources
+        for source_path in discover_files(source, args)
+    ]
+    if args.limit is not None and args.limit >= 0:
+        source_file_pairs = source_file_pairs[: args.limit]
+
+    total_files = len(source_file_pairs)
+    if total_files == 0:
+        print("No source files matched the current filters.", file=sys.stderr)
+        return 1
+
+    entries: list[Entry] = []
+    for index, (source, source_path) in enumerate(source_file_pairs, start=1):
+        rel = source_path.relative_to(source.source_root)
+        print(f"[{index}/{total_files}] {source.name}: {rel}")
+        entry = build_entry(
+            source_path=source_path,
+            source=source,
+            output_dir=output_dir,
+            metadata_dir=metadata_dir,
+            preview_dir=preview_dir,
+            args=args,
+            workspace_root=workspace_root,
+        )
+        entries.append(entry)
+
+    payload = build_payload(entries, args, sources, workspace_root)
+    write_catalog_json(output_dir, payload)
+    write_catalog_html(output_dir, payload)
+
+    print(f"\nCatalog written to {output_dir / 'index.html'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

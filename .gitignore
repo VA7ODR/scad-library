@@ -1,0 +1,6 @@
+.catalog/
+.catalog-test/
+
+tools/__pycache__/
+*.pyc
+*.3mf
