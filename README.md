@@ -14,6 +14,16 @@ It can:
 
 This repository is the tool only. It does not contain any model libraries.
 
+## Screenshots
+
+Catalog overview:
+
+![SCAD Catalog overview](docs/screenshots/catalog-overview.png)
+
+Customizer modal:
+
+![SCAD Catalog customizer modal](docs/screenshots/customizer-modal.png)
+
 ## License
 
 This project is licensed under the `GNU Affero General Public License v3.0 or later` (`AGPL-3.0-or-later`).
