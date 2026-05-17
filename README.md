@@ -11,6 +11,7 @@ It can:
 - open source `.scad` files in OpenSCAD
 - open baked `.stl` files directly in a slicer
 - manage source folders from the browser
+- optionally enrich entries with local Ollama-generated summaries, tags, and friendlier parameter labels
 
 This repository is the tool only. It does not contain any model libraries.
 
@@ -55,6 +56,21 @@ Example:
 
 ```json
 {
+  "tools": {
+    "openscadBin": "openscad-nightly",
+    "slicerBin": ""
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "ollama",
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "qwen3:4b-instruct",
+    "timeout": 30,
+    "includeScad": true,
+    "includeStl": false,
+    "maxSourceChars": 12000,
+    "maxCommentChars": 3000
+  },
   "sources": [
     {
       "id": "my-scad-library",
@@ -88,6 +104,25 @@ Source fields:
 - `includeInProgress`: SCAD only
 - `includeDeprecated`: SCAD only
 
+Tool fields:
+
+- `openscadBin`: full path or command name for OpenSCAD
+- `slicerBin`: optional full path or command name for OrcaSlicer or another slicer
+
+AI fields:
+
+- `enabled`: turn local AI enrichment on or off
+- `provider`: currently `ollama`
+- `baseUrl`: Ollama API base URL
+- `model`: local model name such as `qwen3:4b-instruct`
+- `timeout`: request timeout in seconds
+- `includeScad`: allow AI summaries/tags/parameter labels for SCAD entries
+- `includeStl`: allow AI summaries/tags for STL entries
+- `maxSourceChars`: max source excerpt sent to Ollama per SCAD file
+- `maxCommentChars`: max leading comment text sent to Ollama per SCAD file
+
+If AI is enabled but Ollama is not running or the model is unavailable, catalog generation falls back to the current non-AI behavior.
+
 ## Build the catalog
 
 From the repo root:
@@ -111,6 +146,8 @@ python3 tools/scad_catalog.py --force
 python3 tools/scad_catalog.py --limit 10
 python3 tools/scad_catalog.py --skip-previews
 python3 tools/scad_catalog.py --config /path/to/other-sources.json
+python3 tools/scad_catalog.py --ai --ollama-model qwen3:8b
+python3 tools/scad_catalog.py --no-ai
 ```
 
 ## Run the local app
@@ -135,6 +172,7 @@ The app currently supports:
 - a `Baked STL` tab
 - source filtering
 - rescan from the browser
+- force a full rebuild from the browser
 - folder/source editing from the browser
 - OpenSCAD launch for `.scad` entries
 - slicer launch for `.stl` entries
@@ -143,5 +181,7 @@ The app currently supports:
 
 - SCAD previews are rendered by `openscad-nightly`
 - STL previews are also rendered by `openscad-nightly` through generated wrapper `.scad` files
+- AI enrichment is optional and cached under `.catalog/ai/`
+- AI enrichment never edits or rewrites your SCAD files
 - the server defaults to `openscad-nightly`
-- slicer launch is optional and configurable from the server command line
+- OpenSCAD and slicer paths can be configured in `sources.json` or overridden on the server command line

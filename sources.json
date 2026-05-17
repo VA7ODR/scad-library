@@ -1,4 +1,19 @@
 {
+  "tools": {
+    "openscadBin": "openscad-nightly",
+    "slicerBin": ""
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "ollama",
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "qwen3:4b-instruct",
+    "timeout": 30,
+    "includeScad": true,
+    "includeStl": false,
+    "maxSourceChars": 12000,
+    "maxCommentChars": 3000
+  },
   "sources": [
     {
       "id": "my-scad-library",

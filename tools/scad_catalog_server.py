@@ -24,7 +24,7 @@ DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_CATALOG_DIR = ".catalog"
 DEFAULT_OPENSCAD_BIN = "openscad-nightly"
-DEFAULT_SLICER_BIN = "/home/jim/Downloads/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.3.2.AppImage"
+DEFAULT_SLICER_BIN = ""
 DEFAULT_CONFIG_PATH = "sources.json"
 
 
@@ -55,8 +55,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openscad-bin",
-        default=DEFAULT_OPENSCAD_BIN,
-        help="OpenSCAD executable to use (default: openscad-nightly).",
+        default=None,
+        help="OpenSCAD executable override.",
     )
     parser.add_argument(
         "--timeout",
@@ -71,8 +71,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--slicer-bin",
-        default=DEFAULT_SLICER_BIN,
-        help=f"Slicer executable to launch after STL export (default: {DEFAULT_SLICER_BIN})",
+        default=None,
+        help="Slicer executable override.",
     )
     parser.add_argument(
         "--config",
@@ -140,10 +140,22 @@ def resolve_executable(command_text: str) -> str | None:
     return shutil.which(command_text)
 
 
+def normalize_tool_text(value: Any, *, allow_empty: bool = False) -> str:
+    if value is None and allow_empty:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Tool paths must be strings.")
+    text = value.strip()
+    if not text and not allow_empty:
+        raise ValueError("Tool paths must be non-empty strings.")
+    return text
+
+
 class CatalogRequestHandler(SimpleHTTPRequestHandler):
     def __init__(
         self,
         *args: Any,
+        builder_script_path: Path,
         workspace_root: Path,
         catalog_dir: Path,
         openscad_bin: str,
@@ -153,6 +165,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         imgsize: str,
         **kwargs: Any,
     ) -> None:
+        self.builder_script_path = builder_script_path
         self.workspace_root = workspace_root
         self.catalog_dir = catalog_dir
         self.openscad_bin = openscad_bin
@@ -237,6 +250,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
     def send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -259,9 +278,60 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             raise ValueError("Config file must contain a 'sources' array.")
         return payload
 
+    def effective_tools(self) -> dict[str, str]:
+        payload = self.config_payload()
+        raw_tools = payload.get("tools", {})
+        if raw_tools is None:
+            raw_tools = {}
+        if not isinstance(raw_tools, dict):
+            raise ValueError("Top-level 'tools' config must be an object.")
+
+        openscad_bin = self.openscad_bin or raw_tools.get("openscadBin", DEFAULT_OPENSCAD_BIN)
+        slicer_bin = self.slicer_bin
+        if slicer_bin is None:
+            slicer_bin = raw_tools.get("slicerBin", DEFAULT_SLICER_BIN)
+
+        return {
+            "openscadBin": normalize_tool_text(openscad_bin),
+            "slicerBin": normalize_tool_text(slicer_bin, allow_empty=True),
+        }
+
     def validate_config_payload(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             raise ValueError("Config payload must be a JSON object.")
+        tools_config = payload.get("tools")
+        if tools_config is not None:
+            if not isinstance(tools_config, dict):
+                raise ValueError("Top-level 'tools' config must be an object.")
+            if "openscadBin" in tools_config and (
+                not isinstance(tools_config["openscadBin"], str)
+                or not tools_config["openscadBin"].strip()
+            ):
+                raise ValueError("Tools config field 'openscadBin' must be a non-empty string.")
+            if "slicerBin" in tools_config and not isinstance(tools_config["slicerBin"], str):
+                raise ValueError("Tools config field 'slicerBin' must be a string.")
+        ai_config = payload.get("ai")
+        if ai_config is not None:
+            if not isinstance(ai_config, dict):
+                raise ValueError("Top-level 'ai' config must be an object.")
+            string_fields = ("provider", "baseUrl", "model")
+            for field in string_fields:
+                if field in ai_config and (
+                    not isinstance(ai_config[field], str) or not ai_config[field].strip()
+                ):
+                    raise ValueError(f"AI config field '{field}' must be a non-empty string.")
+            bool_fields = ("enabled", "includeScad", "includeStl")
+            for field in bool_fields:
+                if field in ai_config and not isinstance(ai_config[field], bool):
+                    raise ValueError(f"AI config field '{field}' must be boolean.")
+            int_fields = ("timeout", "maxSourceChars", "maxCommentChars")
+            for field in int_fields:
+                if field in ai_config and (
+                    isinstance(ai_config[field], bool)
+                    or not isinstance(ai_config[field], int)
+                    or ai_config[field] <= 0
+                ):
+                    raise ValueError(f"AI config field '{field}' must be a positive integer.")
         sources = payload.get("sources")
         if not isinstance(sources, list) or not sources:
             raise ValueError("Config payload must contain a non-empty 'sources' array.")
@@ -328,10 +398,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         relative = artifact_path.relative_to(self.workspace_root)
         return "/" + relative.as_posix()
 
-    def launch_slicer(self, artifact_path: Path) -> tuple[bool, str | None]:
-        slicer_path = resolve_executable(self.slicer_bin)
+    def launch_slicer(self, artifact_path: Path, slicer_bin: str) -> tuple[bool, str | None]:
+        if not slicer_bin:
+            return False, "No slicer is configured."
+        slicer_path = resolve_executable(slicer_bin)
         if not slicer_path:
-            return False, f"Slicer not found: {self.slicer_bin}"
+            return False, f"Slicer not found: {slicer_bin}"
         if not os.access(slicer_path, os.X_OK):
             return False, f"Slicer is not executable: {slicer_path}"
 
@@ -349,10 +421,15 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             return False, f"Failed to launch slicer: {exc}"
         return True, None
 
-    def launch_openscad(self, source_path: Path, library_paths: list[str]) -> tuple[bool, str | None]:
-        openscad_path = resolve_executable(self.openscad_bin)
+    def launch_openscad(
+        self,
+        source_path: Path,
+        library_paths: list[str],
+        openscad_bin: str,
+    ) -> tuple[bool, str | None]:
+        openscad_path = resolve_executable(openscad_bin)
         if not openscad_path:
-            return False, f"OpenSCAD not found: {self.openscad_bin}"
+            return False, f"OpenSCAD not found: {openscad_bin}"
         if not os.access(openscad_path, os.X_OK):
             return False, f"OpenSCAD is not executable: {openscad_path}"
         try:
@@ -416,6 +493,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
     def handle_get_config(self) -> None:
         try:
             payload = self.config_payload()
+            effective_tools = self.effective_tools()
         except ValueError as exc:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
             return
@@ -425,6 +503,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
                 "ok": True,
                 "configPath": str(self.config_path),
                 "config": payload,
+                "effectiveTools": effective_tools,
             },
         )
 
@@ -462,21 +541,41 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         )
 
     def handle_rescan(self) -> None:
-        script_path = (self.workspace_root / "tools" / "scad_catalog.py").resolve()
+        force = False
+        length_header = self.headers.get("Content-Length")
+        if length_header:
+            try:
+                content_length = int(length_header)
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+                if body:
+                    payload = json.loads(body)
+                    if isinstance(payload, dict):
+                        force = bool(payload.get("force", False))
+            except (ValueError, json.JSONDecodeError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid JSON body"})
+                return
+
+        try:
+            tools = self.effective_tools()
+        except ValueError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
         command = [
             sys.executable,
-            str(script_path),
+            str(self.builder_script_path),
             "--config",
             str(self.config_path),
             "--output-dir",
             str(self.catalog_dir),
             "--openscad-bin",
-            self.openscad_bin,
+            tools["openscadBin"],
             "--imgsize",
             self.imgsize,
             "--timeout",
             str(self.timeout_seconds),
         ]
+        if force:
+            command.append("--force")
         result = subprocess.run(
             command,
             cwd=self.workspace_root,
@@ -507,6 +606,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
                 "ok": True,
                 "entryCount": len(catalog),
                 "sourceCount": source_count,
+                "forced": force,
                 "command": " ".join(shlex.quote(part) for part in command),
             },
         )
@@ -520,7 +620,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             return
         source_path = entry["_resolved_source_path"]
         library_paths = entry.get("libraryPaths", [])
-        launched, error = self.launch_openscad(source_path, library_paths)
+        try:
+            tools = self.effective_tools()
+        except ValueError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        launched, error = self.launch_openscad(source_path, library_paths, tools["openscadBin"])
         if not launched:
             self.send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -540,7 +645,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
 
     def handle_open_in_slicer(self, entry: dict[str, Any]) -> None:
         source_path = entry["_resolved_source_path"]
-        launched, error = self.launch_slicer(source_path)
+        try:
+            tools = self.effective_tools()
+        except ValueError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        launched, error = self.launch_slicer(source_path, tools["slicerBin"])
         if not launched:
             self.send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -555,7 +665,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             {
                 "ok": True,
                 "openedPath": str(source_path),
-                "slicerPath": self.slicer_bin,
+                "slicerPath": tools["slicerBin"],
             },
         )
 
@@ -567,6 +677,11 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         source_path = entry["absoluteSourcePath"]
         resolved_source = entry["_resolved_source_path"]
         library_paths = entry.get("libraryPaths", [])
+        try:
+            tools = self.effective_tools()
+        except ValueError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
         digest = request_hash(source_path, parameters)
         output_path = (
             self.catalog_dir
@@ -577,7 +692,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         command = [
-            self.openscad_bin,
+            tools["openscadBin"],
             "--autocenter",
             "--viewall",
             "--imgsize",
@@ -619,12 +734,17 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         source_path = entry["absoluteSourcePath"]
         resolved_source = entry["_resolved_source_path"]
         library_paths = entry.get("libraryPaths", [])
+        try:
+            tools = self.effective_tools()
+        except ValueError as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
         digest = request_hash(source_path, parameters)
         output_path = self.catalog_dir / "custom" / "stl" / f"{resolved_source.stem}-{digest}.stl"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         command = [
-            self.openscad_bin,
+            tools["openscadBin"],
             "--export-format",
             "binstl",
             *build_definition_args(parameters),
@@ -644,7 +764,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        launched_slicer, slicer_error = self.launch_slicer(output_path)
+        launched_slicer, slicer_error = self.launch_slicer(output_path, tools["slicerBin"])
 
         self.send_json(
             HTTPStatus.OK,
@@ -653,7 +773,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
                 "artifactPath": self.artifact_url(output_path),
                 "command": shell_command(command, self.workspace_root, library_paths),
                 "launchedSlicer": launched_slicer,
-                "slicerPath": self.slicer_bin,
+                "slicerPath": tools["slicerBin"],
                 "slicerError": slicer_error,
             },
         )
@@ -663,6 +783,7 @@ def main() -> int:
     args = parse_args()
     workspace_root = Path(args.workspace_root).resolve()
     catalog_dir = (workspace_root / args.catalog_dir).resolve()
+    builder_script_path = (Path(__file__).resolve().parent / "scad_catalog.py").resolve()
     config_path = Path(args.config).expanduser()
     if not config_path.is_absolute():
         config_path = (workspace_root / config_path).resolve()
@@ -671,6 +792,7 @@ def main() -> int:
 
     handler = partial(
         CatalogRequestHandler,
+        builder_script_path=builder_script_path,
         workspace_root=workspace_root,
         catalog_dir=catalog_dir,
         openscad_bin=args.openscad_bin,

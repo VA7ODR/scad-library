@@ -14,12 +14,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 DEFAULT_CONFIG_PATH = "sources.json"
 DEFAULT_OUTPUT_DIR = ".catalog"
+DEFAULT_OPENSCAD_BIN = "openscad-nightly"
+DEFAULT_SLICER_BIN = ""
 HELPER_DIRS = {"Modules"}
 IN_PROGRESS_DIRS = {"InProgress"}
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct"
+DEFAULT_AI_TIMEOUT = 30
+DEFAULT_AI_MAX_SOURCE_CHARS = 12000
+DEFAULT_AI_MAX_COMMENT_CHARS = 3000
+AI_PROMPT_VERSION = 1
 
 
 @dataclass
@@ -33,6 +43,35 @@ class SourceConfig:
     include_helpers: bool
     include_in_progress: bool
     include_deprecated: bool
+
+
+@dataclass
+class AIConfig:
+    enabled: bool
+    provider: str
+    base_url: str
+    model: str
+    timeout_seconds: int
+    include_scad: bool
+    include_stl: bool
+    max_source_chars: int
+    max_comment_chars: int
+
+
+@dataclass
+class AIState:
+    enabled: bool
+    available: bool
+    provider: str
+    base_url: str
+    model: str
+    reason: str | None = None
+
+
+@dataclass
+class ToolConfig:
+    openscad_bin: str
+    slicer_bin: str
 
 
 @dataclass
@@ -56,8 +95,23 @@ class Entry:
     preview_path: str | None
     metadata_error: str | None
     preview_error: str | None
+    ai_summary: str | None
+    ai_use_cases: list[str]
+    ai_search_terms: list[str]
+    ai_parameter_hints: dict[str, dict[str, str]]
+    ai_error: str | None
 
     def to_index_record(self) -> dict[str, Any]:
+        ai_labels = [
+            hint.get("label", "")
+            for hint in self.ai_parameter_hints.values()
+            if isinstance(hint, dict)
+        ]
+        ai_descriptions = [
+            hint.get("description", "")
+            for hint in self.ai_parameter_hints.values()
+            if isinstance(hint, dict)
+        ]
         search_parts = [
             self.source_name,
             self.title,
@@ -67,7 +121,27 @@ class Entry:
             *self.group_names,
             *self.parameter_names,
             *self.option_values,
+            self.ai_summary or "",
+            *self.ai_use_cases,
+            *self.ai_search_terms,
+            *ai_labels,
+            *ai_descriptions,
         ]
+        ai_payload = None
+        if (
+            self.ai_summary
+            or self.ai_use_cases
+            or self.ai_search_terms
+            or self.ai_parameter_hints
+            or self.ai_error
+        ):
+            ai_payload = {
+                "summary": self.ai_summary,
+                "useCases": self.ai_use_cases,
+                "searchTerms": self.ai_search_terms,
+                "parameterHints": self.ai_parameter_hints,
+                "error": self.ai_error,
+            }
         return {
             "id": self.id,
             "entryType": self.entry_type,
@@ -86,6 +160,7 @@ class Entry:
             "previewPath": self.preview_path,
             "metadataError": self.metadata_error,
             "previewError": self.preview_error,
+            "ai": ai_payload,
             "searchText": " ".join(part for part in search_parts if part).lower(),
         }
 
@@ -106,8 +181,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--openscad-bin",
-        default="openscad-nightly",
-        help="OpenSCAD executable to use for metadata and preview export.",
+        default=None,
+        help="OpenSCAD executable override for metadata and preview export.",
     )
     parser.add_argument(
         "--imgsize",
@@ -151,6 +226,32 @@ def parse_args() -> argparse.Namespace:
         default=180,
         help="Timeout in seconds for each OpenSCAD invocation (default: 180).",
     )
+    parser.add_argument(
+        "--ai",
+        action="store_true",
+        help="Enable optional AI metadata enrichment during indexing.",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Disable AI metadata enrichment even if enabled in the config file.",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default=None,
+        help=f"Ollama base URL override (default from config or {DEFAULT_OLLAMA_URL}).",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default=None,
+        help=f"Ollama model override (default from config or {DEFAULT_OLLAMA_MODEL}).",
+    )
+    parser.add_argument(
+        "--ai-timeout",
+        type=int,
+        default=None,
+        help=f"AI request timeout in seconds (default from config or {DEFAULT_AI_TIMEOUT}).",
+    )
     return parser.parse_args()
 
 
@@ -187,15 +288,125 @@ def dedupe_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
-def load_sources(args: argparse.Namespace, workspace_root: Path) -> list[SourceConfig]:
-    config_path = resolve_config_path(args.config, workspace_root)
-    if not config_path.exists():
-        raise SystemExit(f"Source config does not exist: {config_path}")
-
+def load_config_payload(config_path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Source config is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("Source config root must be a JSON object.")
+    return payload
+
+
+def parse_positive_int(
+    value: Any,
+    *,
+    field_name: str,
+    default: int,
+) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SystemExit(f"AI config field '{field_name}' must be a positive integer.")
+    return value
+
+
+def parse_bool(value: Any, *, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise SystemExit(f"AI config field '{field_name}' must be boolean.")
+    return value
+
+
+def load_ai_config(payload: dict[str, Any], args: argparse.Namespace) -> AIConfig:
+    raw_ai = payload.get("ai", {})
+    if raw_ai is None:
+        raw_ai = {}
+    if not isinstance(raw_ai, dict):
+        raise SystemExit("Top-level 'ai' config must be an object when present.")
+
+    provider = raw_ai.get("provider", "ollama")
+    if not isinstance(provider, str) or not provider.strip():
+        raise SystemExit("AI config field 'provider' must be a non-empty string.")
+    provider = provider.strip().lower()
+
+    base_url = raw_ai.get("baseUrl", DEFAULT_OLLAMA_URL)
+    if args.ollama_url is not None:
+        base_url = args.ollama_url
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise SystemExit("AI config field 'baseUrl' must be a non-empty string.")
+
+    model = raw_ai.get("model", DEFAULT_OLLAMA_MODEL)
+    if args.ollama_model is not None:
+        model = args.ollama_model
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit("AI config field 'model' must be a non-empty string.")
+
+    timeout_seconds = parse_positive_int(
+        args.ai_timeout if args.ai_timeout is not None else raw_ai.get("timeout"),
+        field_name="timeout",
+        default=DEFAULT_AI_TIMEOUT,
+    )
+    max_source_chars = parse_positive_int(
+        raw_ai.get("maxSourceChars"),
+        field_name="maxSourceChars",
+        default=DEFAULT_AI_MAX_SOURCE_CHARS,
+    )
+    max_comment_chars = parse_positive_int(
+        raw_ai.get("maxCommentChars"),
+        field_name="maxCommentChars",
+        default=DEFAULT_AI_MAX_COMMENT_CHARS,
+    )
+
+    enabled = parse_bool(raw_ai.get("enabled"), field_name="enabled", default=False)
+    if args.ai:
+        enabled = True
+    if args.no_ai:
+        enabled = False
+
+    return AIConfig(
+        enabled=enabled,
+        provider=provider,
+        base_url=base_url.rstrip("/"),
+        model=model.strip(),
+        timeout_seconds=timeout_seconds,
+        include_scad=parse_bool(raw_ai.get("includeScad"), field_name="includeScad", default=True),
+        include_stl=parse_bool(raw_ai.get("includeStl"), field_name="includeStl", default=False),
+        max_source_chars=max_source_chars,
+        max_comment_chars=max_comment_chars,
+    )
+
+
+def load_tool_config(payload: dict[str, Any], args: argparse.Namespace) -> ToolConfig:
+    raw_tools = payload.get("tools", {})
+    if raw_tools is None:
+        raw_tools = {}
+    if not isinstance(raw_tools, dict):
+        raise SystemExit("Top-level 'tools' config must be an object when present.")
+
+    openscad_bin = args.openscad_bin or raw_tools.get("openscadBin", DEFAULT_OPENSCAD_BIN)
+    slicer_bin = raw_tools.get("slicerBin", DEFAULT_SLICER_BIN)
+
+    if not isinstance(openscad_bin, str) or not openscad_bin.strip():
+        raise SystemExit("Tools config field 'openscadBin' must be a non-empty string.")
+    if slicer_bin is None:
+        slicer_bin = ""
+    if not isinstance(slicer_bin, str):
+        raise SystemExit("Tools config field 'slicerBin' must be a string.")
+
+    return ToolConfig(openscad_bin=openscad_bin.strip(), slicer_bin=slicer_bin.strip())
+
+
+def load_sources(
+    args: argparse.Namespace,
+    workspace_root: Path,
+) -> tuple[list[SourceConfig], AIConfig, ToolConfig]:
+    config_path = resolve_config_path(args.config, workspace_root)
+    if not config_path.exists():
+        raise SystemExit(f"Source config does not exist: {config_path}")
+
+    payload = load_config_payload(config_path)
 
     raw_sources = payload.get("sources")
     if not isinstance(raw_sources, list) or not raw_sources:
@@ -264,7 +475,7 @@ def load_sources(args: argparse.Namespace, workspace_root: Path) -> list[SourceC
             )
         )
 
-    return sources
+    return sources, load_ai_config(payload, args), load_tool_config(payload, args)
 
 
 def classify_tags(path: Path) -> list[str]:
@@ -309,6 +520,366 @@ def discover_files(source: SourceConfig, args: argparse.Namespace) -> list[Path]
             include_deprecated=source.include_deprecated,
         )
     ]
+
+
+def collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_leading_comment(source_text: str, max_chars: int) -> str:
+    match = re.search(r"\A\s*(/\*.*?\*/|(?://[^\n]*\n)+)", source_text, re.DOTALL)
+    if not match:
+        return ""
+    comment = match.group(1)
+    comment = re.sub(r"^\s*//\s?", "", comment, flags=re.MULTILINE)
+    comment = comment.replace("/*", " ").replace("*/", " ")
+    return collapse_whitespace(comment)[:max_chars]
+
+
+def read_text_excerpt(source_path: Path, max_chars: int) -> str:
+    try:
+        text = source_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    return text[:max_chars]
+
+
+def ollama_request(
+    ai_config: AIConfig,
+    endpoint: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    method: str = "POST",
+) -> dict[str, Any]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib_request.Request(
+        f"{ai_config.base_url}{endpoint}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=ai_config.timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc.reason) if hasattr(exc, "reason") else str(exc)) from exc
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ollama returned invalid JSON: {exc}") from exc
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+        raise RuntimeError(parsed["error"])
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Ollama returned an unexpected response payload.")
+    return parsed
+
+
+def probe_ai(ai_config: AIConfig) -> AIState:
+    if not ai_config.enabled:
+        return AIState(
+            enabled=False,
+            available=False,
+            provider=ai_config.provider,
+            base_url=ai_config.base_url,
+            model=ai_config.model,
+            reason="disabled",
+        )
+    if ai_config.provider != "ollama":
+        return AIState(
+            enabled=True,
+            available=False,
+            provider=ai_config.provider,
+            base_url=ai_config.base_url,
+            model=ai_config.model,
+            reason=f"unsupported AI provider '{ai_config.provider}'",
+        )
+
+    try:
+        payload = ollama_request(ai_config, "/api/tags", method="GET")
+    except RuntimeError as exc:
+        return AIState(
+            enabled=True,
+            available=False,
+            provider=ai_config.provider,
+            base_url=ai_config.base_url,
+            model=ai_config.model,
+            reason=f"Ollama unavailable at {ai_config.base_url}: {exc}",
+        )
+
+    models = payload.get("models", [])
+    available_names = {
+        item.get("name")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    available_names.update(
+        item.get("model")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("model"), str)
+    )
+    if ai_config.model not in available_names:
+        return AIState(
+            enabled=True,
+            available=False,
+            provider=ai_config.provider,
+            base_url=ai_config.base_url,
+            model=ai_config.model,
+            reason=f"model '{ai_config.model}' is not available in local Ollama",
+        )
+
+    return AIState(
+        enabled=True,
+        available=True,
+        provider=ai_config.provider,
+        base_url=ai_config.base_url,
+        model=ai_config.model,
+    )
+
+
+def build_ai_context(
+    source_path: Path,
+    source: SourceConfig,
+    *,
+    title: str,
+    category: str,
+    tags: list[str],
+    parameters: list[dict[str, Any]],
+    ai_config: AIConfig,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "sourceType": source.source_type,
+        "sourceName": source.name,
+        "relativePath": str(source_path.relative_to(source.source_root)),
+        "title": title,
+        "category": category,
+        "tags": tags,
+    }
+    if source.source_type == "scad":
+        source_excerpt = read_text_excerpt(source_path, ai_config.max_source_chars)
+        context["leadingComment"] = extract_leading_comment(
+            source_excerpt,
+            ai_config.max_comment_chars,
+        )
+        context["sourceExcerpt"] = source_excerpt
+        context["parameters"] = [
+            {
+                "name": parameter.get("name"),
+                "group": parameter.get("group"),
+                "type": parameter.get("type"),
+                "caption": parameter.get("caption"),
+                "initial": parameter.get("initial"),
+                "options": [
+                    {
+                        "name": option.get("name"),
+                        "value": option.get("value"),
+                    }
+                    for option in parameter.get("options", [])
+                    if isinstance(option, dict)
+                ],
+            }
+            for parameter in parameters
+            if isinstance(parameter, dict) and isinstance(parameter.get("name"), str)
+        ]
+    return context
+
+
+def normalize_ai_enrichment(
+    raw: dict[str, Any],
+    *,
+    parameter_names: set[str],
+) -> dict[str, Any]:
+    summary = collapse_whitespace(str(raw.get("summary", "")))[:320]
+
+    use_cases: list[str] = []
+    for value in raw.get("useCases", []):
+        text = collapse_whitespace(str(value))[:100]
+        if text and text not in use_cases:
+            use_cases.append(text)
+
+    search_terms: list[str] = []
+    for value in raw.get("searchTerms", []):
+        text = collapse_whitespace(str(value)).lower()[:64]
+        if text and text not in search_terms:
+            search_terms.append(text)
+
+    parameter_hints: dict[str, dict[str, str]] = {}
+    for item in raw.get("parameterHints", []):
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name not in parameter_names:
+            continue
+        label = collapse_whitespace(str(item.get("label", "")))[:80]
+        description = collapse_whitespace(str(item.get("description", "")))[:180]
+        if not label:
+            continue
+        parameter_hints[name] = {"label": label, "description": description}
+
+    return {
+        "summary": summary or None,
+        "useCases": use_cases[:4],
+        "searchTerms": search_terms[:10],
+        "parameterHints": parameter_hints,
+    }
+
+
+def enrich_with_ai(
+    *,
+    ai_dir: Path,
+    entry_id: str,
+    source_path: Path,
+    source: SourceConfig,
+    title: str,
+    category: str,
+    tags: list[str],
+    parameters: list[dict[str, Any]],
+    ai_config: AIConfig,
+    ai_state: AIState,
+    force: bool,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not ai_state.available:
+        return None, None
+    if source.source_type == "scad" and not ai_config.include_scad:
+        return None, None
+    if source.source_type == "stl" and not ai_config.include_stl:
+        return None, None
+
+    context = build_ai_context(
+        source_path,
+        source,
+        title=title,
+        category=category,
+        tags=tags,
+        parameters=parameters,
+        ai_config=ai_config,
+    )
+    input_hash = hashlib.sha1(
+        json.dumps(context, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_path = ai_dir / f"{entry_id}.json"
+
+    if not force and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cached = None
+        if isinstance(cached, dict):
+            meta = cached.get("_meta", {})
+            enrichment = cached.get("enrichment")
+            if (
+                isinstance(meta, dict)
+                and meta.get("inputHash") == input_hash
+                and meta.get("model") == ai_state.model
+                and meta.get("provider") == ai_state.provider
+                and meta.get("promptVersion") == AI_PROMPT_VERSION
+                and isinstance(enrichment, dict)
+            ):
+                return enrichment, None
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "useCases": {"type": "array", "items": {"type": "string"}},
+            "searchTerms": {"type": "array", "items": {"type": "string"}},
+            "parameterHints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "label": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "label", "description"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["summary", "useCases", "searchTerms", "parameterHints"],
+        "additionalProperties": False,
+    }
+    system_prompt = (
+        "You generate cautious catalog metadata for local CAD files. "
+        "Do not suggest editing source files. "
+        "Use only the supplied context. "
+        "If the purpose is unclear, stay generic rather than guessing. "
+        "Friendly parameter labels must refer only to existing parameter names."
+    )
+    prompt = (
+        "Return concise JSON metadata for this catalog entry.\n"
+        "Requirements:\n"
+        "- summary: 1 or 2 short sentences describing what the model appears to be for\n"
+        "- useCases: up to 4 short practical uses\n"
+        "- searchTerms: up to 10 lower-case search terms or synonyms\n"
+        "- parameterHints: only for real parameters already present in the input\n"
+        "- parameterHints.label should be friendlier than the raw variable name\n"
+        "- parameterHints.description should explain the user-facing meaning in plain language\n"
+        "- never invent manufacturing claims or dimensions not present in the input\n\n"
+        f"Input:\n{json.dumps(context, indent=2, sort_keys=True)}"
+    )
+
+    try:
+        response = ollama_request(
+            ai_config,
+            "/api/generate",
+            {
+                "model": ai_state.model,
+                "system": system_prompt,
+                "prompt": prompt,
+                "format": schema,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.2},
+            },
+        )
+    except RuntimeError as exc:
+        return None, f"AI enrichment failed: {exc}"
+
+    response_text = response.get("response")
+    if not isinstance(response_text, str) or not response_text.strip():
+        return None, "AI enrichment returned an empty response"
+
+    try:
+        raw_enrichment = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        return None, f"AI enrichment returned invalid JSON: {exc}"
+
+    enrichment = normalize_ai_enrichment(
+        raw_enrichment if isinstance(raw_enrichment, dict) else {},
+        parameter_names={
+            parameter["name"]
+            for parameter in parameters
+            if isinstance(parameter, dict) and isinstance(parameter.get("name"), str)
+        },
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "_meta": {
+                    "generatedAt": datetime.now(timezone.utc).isoformat(),
+                    "provider": ai_state.provider,
+                    "model": ai_state.model,
+                    "inputHash": input_hash,
+                    "promptVersion": AI_PROMPT_VERSION,
+                },
+                "enrichment": enrichment,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return enrichment, None
 
 
 def run_openscad(
@@ -445,8 +1016,11 @@ def build_entry(
     output_dir: Path,
     metadata_dir: Path,
     preview_dir: Path,
+    ai_dir: Path,
     args: argparse.Namespace,
     workspace_root: Path,
+    ai_config: AIConfig,
+    ai_state: AIState,
 ) -> Entry:
     if source.source_type == "stl":
         return build_stl_entry(
@@ -454,8 +1028,11 @@ def build_entry(
             source=source,
             output_dir=output_dir,
             preview_dir=preview_dir,
+            ai_dir=ai_dir,
             args=args,
             workspace_root=workspace_root,
+            ai_config=ai_config,
+            ai_state=ai_state,
         )
 
     return build_scad_entry(
@@ -464,8 +1041,11 @@ def build_entry(
         output_dir=output_dir,
         metadata_dir=metadata_dir,
         preview_dir=preview_dir,
+        ai_dir=ai_dir,
         args=args,
         workspace_root=workspace_root,
+        ai_config=ai_config,
+        ai_state=ai_state,
     )
 
 
@@ -475,8 +1055,11 @@ def build_scad_entry(
     output_dir: Path,
     metadata_dir: Path,
     preview_dir: Path,
+    ai_dir: Path,
     args: argparse.Namespace,
     workspace_root: Path,
+    ai_config: AIConfig,
+    ai_state: AIState,
 ) -> Entry:
     rel_from_source_root = source_path.relative_to(source.source_root)
     category = rel_from_source_root.parts[0] if rel_from_source_root.parts else source.name
@@ -515,6 +1098,20 @@ def build_scad_entry(
                 option_name = option.get("name")
                 if isinstance(option_name, str):
                     option_values.append(option_name)
+
+    ai_enrichment, ai_error = enrich_with_ai(
+        ai_dir=ai_dir,
+        entry_id=entry_id,
+        source_path=source_path,
+        source=source,
+        title=title,
+        category=category,
+        tags=tags,
+        parameters=parameters,
+        ai_config=ai_config,
+        ai_state=ai_state,
+        force=args.force,
+    )
 
     preview_error = None
     if not args.skip_previews:
@@ -556,6 +1153,11 @@ def build_scad_entry(
         preview_path=preview_path,
         metadata_error=metadata_error,
         preview_error=preview_error,
+        ai_summary=ai_enrichment.get("summary") if ai_enrichment else None,
+        ai_use_cases=ai_enrichment.get("useCases", []) if ai_enrichment else [],
+        ai_search_terms=ai_enrichment.get("searchTerms", []) if ai_enrichment else [],
+        ai_parameter_hints=ai_enrichment.get("parameterHints", {}) if ai_enrichment else {},
+        ai_error=ai_error,
     )
 
 
@@ -564,8 +1166,11 @@ def build_stl_entry(
     source: SourceConfig,
     output_dir: Path,
     preview_dir: Path,
+    ai_dir: Path,
     args: argparse.Namespace,
     workspace_root: Path,
+    ai_config: AIConfig,
+    ai_state: AIState,
 ) -> Entry:
     rel_from_source_root = source_path.relative_to(source.source_root)
     category = rel_from_source_root.parts[0] if rel_from_source_root.parts else source.name
@@ -591,6 +1196,19 @@ def build_stl_entry(
     preview_path = (
         os.path.relpath(preview_file, output_dir) if preview_file.exists() else None
     )
+    ai_enrichment, ai_error = enrich_with_ai(
+        ai_dir=ai_dir,
+        entry_id=entry_id,
+        source_path=source_path,
+        source=source,
+        title=source_path.stem,
+        category=category,
+        tags=[],
+        parameters=[],
+        ai_config=ai_config,
+        ai_state=ai_state,
+        force=args.force,
+    )
 
     return Entry(
         id=entry_id,
@@ -612,6 +1230,11 @@ def build_stl_entry(
         preview_path=preview_path,
         metadata_error=None,
         preview_error=preview_error,
+        ai_summary=ai_enrichment.get("summary") if ai_enrichment else None,
+        ai_use_cases=ai_enrichment.get("useCases", []) if ai_enrichment else [],
+        ai_search_terms=ai_enrichment.get("searchTerms", []) if ai_enrichment else [],
+        ai_parameter_hints=ai_enrichment.get("parameterHints", {}) if ai_enrichment else {},
+        ai_error=ai_error,
     )
 
 
@@ -784,6 +1407,11 @@ def html_template(payload: dict[str, Any]) -> str:
       font-family: "IBM Plex Mono", "Consolas", monospace;
       font-size: 0.85rem;
       word-break: break-word;
+    }}
+    .description {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
     }}
     .stats {{
       display: flex;
@@ -975,6 +1603,11 @@ def html_template(payload: dict[str, Any]) -> str:
       font-size: 0.84rem;
       line-height: 1.35;
     }}
+    .field-meta {{
+      color: var(--muted);
+      font-size: 0.8rem;
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+    }}
     .checkbox-row {{
       display: flex;
       align-items: center;
@@ -1075,8 +1708,7 @@ def html_template(payload: dict[str, Any]) -> str:
       <div class="summary" id="summary"></div>
     </section>
     <div class="top-actions">
-      <button class="secondary" id="rescan-btn" type="button">Rescan Libraries</button>
-      <button class="secondary" id="settings-btn" type="button">Configure Folders</button>
+      <button class="secondary" id="settings-btn" type="button">Configure / Scan</button>
     </div>
     <div class="tabs">
       <button class="secondary tab-active" id="tab-scad-btn" type="button">Customizable SCAD</button>
@@ -1118,12 +1750,13 @@ def html_template(payload: dict[str, Any]) -> str:
     <div class="modal">
       <section class="modal-pane preview-pane">
         <div class="eyebrow">Library Config</div>
-        <h2 class="modal-title">Configure Folders</h2>
+        <h2 class="modal-title">Configure / Scan</h2>
         <p class="small-note" id="config-path-note"></p>
         <div class="status-box" id="settings-status"></div>
         <div class="settings-actions">
           <button class="primary" id="save-settings-btn" type="button">Save Sources</button>
           <button class="secondary" id="save-rescan-btn" type="button">Save And Rescan</button>
+          <button class="secondary" id="save-force-rescan-btn" type="button">Save And Force Rebuild</button>
           <button class="ghost" id="add-source-btn" type="button">Add Source</button>
           <button class="ghost" id="close-settings-btn" type="button">Close</button>
         </div>
@@ -1160,10 +1793,10 @@ def html_template(payload: dict[str, Any]) -> str:
     const copyCommandBtn = document.getElementById("copy-command-btn");
     const resetParamsBtn = document.getElementById("reset-params-btn");
     const closeModalBtn = document.getElementById("close-modal-btn");
-    const rescanBtn = document.getElementById("rescan-btn");
     const settingsBtn = document.getElementById("settings-btn");
     const saveSettingsBtn = document.getElementById("save-settings-btn");
     const saveRescanBtn = document.getElementById("save-rescan-btn");
+    const saveForceRescanBtn = document.getElementById("save-force-rescan-btn");
     const addSourceBtn = document.getElementById("add-source-btn");
     const closeSettingsBtn = document.getElementById("close-settings-btn");
     const settingsList = document.getElementById("settings-list");
@@ -1171,6 +1804,7 @@ def html_template(payload: dict[str, Any]) -> str:
     const configPathNote = document.getElementById("config-path-note");
     const tabScadBtn = document.getElementById("tab-scad-btn");
     const tabStlBtn = document.getElementById("tab-stl-btn");
+    const aiMetadata = payload.ai || null;
 
     let currentEntry = null;
     let currentValues = {{}};
@@ -1198,6 +1832,7 @@ def html_template(payload: dict[str, Any]) -> str:
     function renderSummary(filtered) {{
       const previewCount = filtered.filter((entry) => entry.previewPath).length;
       const errorCount = filtered.filter((entry) => entry.metadataError || entry.previewError).length;
+      const aiCount = filtered.filter((entry) => entry.ai && (entry.ai.summary || entry.ai.searchTerms?.length)).length;
       const scadCount = entries.filter((entry) => entry.entryType === "scad").length;
       const stlCount = entries.filter((entry) => entry.entryType === "stl").length;
       summary.innerHTML = "";
@@ -1209,6 +1844,7 @@ def html_template(payload: dict[str, Any]) -> str:
         `${{scadCount}} scad`,
         `${{stlCount}} stl`,
         `${{previewCount}} with previews`,
+        `${{aiCount}} AI-tagged`,
         `${{errorCount}} with export issues`,
       ];
       for (const label of chips) {{
@@ -1263,6 +1899,13 @@ def html_template(payload: dict[str, Any]) -> str:
       path.textContent = entry.relativePath;
       content.appendChild(path);
 
+      if (entry.ai && entry.ai.summary) {{
+        const description = document.createElement("p");
+        description.className = "description";
+        description.textContent = entry.ai.summary;
+        content.appendChild(description);
+      }}
+
       const stats = document.createElement("div");
       stats.className = "stats";
       stats.appendChild(makeTag(`${{entry.parameterCount}} parameters`));
@@ -1307,7 +1950,7 @@ def html_template(payload: dict[str, Any]) -> str:
         const slicerButton = document.createElement("button");
         slicerButton.className = "secondary";
         slicerButton.type = "button";
-        slicerButton.textContent = "Open In Slicer";
+        slicerButton.textContent = stlOpenButtonLabel();
         slicerButton.disabled = !serverAvailable;
         slicerButton.addEventListener("click", () => openStlInSlicer(entry));
         actions.appendChild(slicerButton);
@@ -1398,6 +2041,10 @@ def html_template(payload: dict[str, Any]) -> str:
       return groups;
     }}
 
+    function parameterHintFor(parameter) {{
+      return currentEntry?.ai?.parameterHints?.[parameter.name] || null;
+    }}
+
     function renderPreviewImage(src, alt) {{
       modalPreview.innerHTML = "";
       const img = document.createElement("img");
@@ -1429,14 +2076,18 @@ def html_template(payload: dict[str, Any]) -> str:
       }});
       commandBox.textContent = [
         `OPENSCADPATH=${{shellQuote(openScadPath)}}`,
-        `${{shellQuote(payload.openscadBin)}} --export-format binstl -o ${{shellQuote(outputPath)}}`,
+        `${{shellQuote(effectiveToolsConfig().openscadBin)}} --export-format binstl -o ${{shellQuote(outputPath)}}`,
         ...defs,
         shellQuote(currentEntry.absoluteSourcePath),
       ].join(" ");
     }}
 
     function makeInput(parameter) {{
+      const hint = parameterHintFor(parameter);
+      const displayLabel = hint?.label || parameter.name;
       if (parameter.type === "boolean") {{
+        const field = document.createElement("div");
+        field.className = "field";
         const wrapper = document.createElement("label");
         wrapper.className = "checkbox-row";
         const input = document.createElement("input");
@@ -1447,18 +2098,42 @@ def html_template(payload: dict[str, Any]) -> str:
           refreshCommandBox();
         }});
         const text = document.createElement("span");
-        text.textContent = parameter.name;
+        text.textContent = displayLabel;
         wrapper.appendChild(input);
         wrapper.appendChild(text);
-        return wrapper;
+        field.appendChild(wrapper);
+        const meta = document.createElement("div");
+        meta.className = "field-meta";
+        meta.textContent = `SCAD variable: ${{parameter.name}}`;
+        field.appendChild(meta);
+        if (hint?.description) {{
+          const aiHelp = document.createElement("div");
+          aiHelp.className = "field-help";
+          aiHelp.textContent = hint.description;
+          field.appendChild(aiHelp);
+        }}
+        if (parameter.caption) {{
+          const help = document.createElement("div");
+          help.className = "field-help";
+          help.textContent = parameter.caption;
+          field.appendChild(help);
+        }}
+        return field;
       }}
 
       const wrapper = document.createElement("div");
       wrapper.className = "field";
 
       const label = document.createElement("label");
-      label.textContent = parameter.name;
+      label.textContent = displayLabel;
       wrapper.appendChild(label);
+
+      if (displayLabel !== parameter.name) {{
+        const meta = document.createElement("div");
+        meta.className = "field-meta";
+        meta.textContent = `SCAD variable: ${{parameter.name}}`;
+        wrapper.appendChild(meta);
+      }}
 
       let input;
       if (parameter.options && parameter.options.length) {{
@@ -1499,6 +2174,12 @@ def html_template(payload: dict[str, Any]) -> str:
       }});
 
       wrapper.appendChild(input);
+      if (hint?.description) {{
+        const aiHelp = document.createElement("div");
+        aiHelp.className = "field-help";
+        aiHelp.textContent = hint.description;
+        wrapper.appendChild(aiHelp);
+      }}
       if (parameter.caption) {{
         const help = document.createElement("div");
         help.className = "field-help";
@@ -1536,7 +2217,6 @@ def html_template(payload: dict[str, Any]) -> str:
       renderPreviewBtn.disabled = !serverAvailable;
       exportStlBtn.disabled = !serverAvailable;
       openScadBtn.disabled = !serverAvailable;
-      rescanBtn.disabled = !serverAvailable;
       settingsBtn.disabled = !serverAvailable;
     }}
 
@@ -1550,6 +2230,7 @@ def html_template(payload: dict[str, Any]) -> str:
     function openCustomizer(entry) {{
       currentEntry = entry;
       currentValues = cloneInitialValues(entry.parameters);
+      refreshConfiguredLabels(editableConfig);
       modalCategory.textContent = `${{entry.sourceName}} / ${{entry.category}}`;
       modalTitle.textContent = entry.title;
       modalPath.textContent = entry.relativePath;
@@ -1615,12 +2296,13 @@ def html_template(payload: dict[str, Any]) -> str:
           entryId: currentEntry.id,
           parameters: currentValues,
         }});
+        const slicerName = slicerDisplayName(data.slicerPath || "");
         if (data.launchedSlicer) {{
-          updateStatus(`Binary STL written to ${{data.artifactPath}} and opened in OrcaSlicer.`, "success");
+          updateStatus(`Binary STL written to ${{data.artifactPath}} and opened in ${{slicerName}}.`, "success");
         }} else if (data.artifactPath) {{
           updateStatus(
             data.slicerError
-              ? `Binary STL written to ${{data.artifactPath}}. OrcaSlicer was not launched: ${{data.slicerError}}`
+              ? `Binary STL written to ${{data.artifactPath}}. ${{slicerName}} was not launched: ${{data.slicerError}}`
               : `Binary STL written to ${{data.artifactPath}}`,
             data.slicerError ? "error" : "success"
           );
@@ -1656,7 +2338,7 @@ def html_template(payload: dict[str, Any]) -> str:
           entryId: entry.id,
           parameters: {{}},
         }});
-        updateStatus(`Opened ${{data.openedPath}} in the slicer.`, "success");
+        updateStatus(`Opened ${{data.openedPath}} in ${{slicerDisplayName(data.slicerPath || "")}}.`, "success");
       }} catch (error) {{
         updateStatus(error.message, "error");
       }}
@@ -1689,6 +2371,81 @@ def html_template(payload: dict[str, Any]) -> str:
       }};
     }}
 
+    function blankToolsConfig() {{
+      return {{
+        openscadBin: "openscad-nightly",
+        slicerBin: "",
+      }};
+    }}
+
+    function blankAiConfig() {{
+      return {{
+        enabled: false,
+        provider: "ollama",
+        baseUrl: "http://127.0.0.1:11434",
+        model: "qwen3:4b-instruct",
+        timeout: 30,
+        includeScad: true,
+        includeStl: false,
+        maxSourceChars: 12000,
+        maxCommentChars: 3000,
+      }};
+    }}
+
+    function effectiveToolsConfig() {{
+      return {{
+        ...blankToolsConfig(),
+        ...(payload.tools || {{}}),
+        ...(editableConfig?.tools || {{}}),
+      }};
+    }}
+
+    function hasConfiguredSlicer(toolsConfig = effectiveToolsConfig()) {{
+      return Boolean((toolsConfig.slicerBin || "").trim());
+    }}
+
+    function isOrcaConfigured(toolsConfig = effectiveToolsConfig()) {{
+      return /orca/i.test(toolsConfig.slicerBin || "");
+    }}
+
+    function exportButtonLabel(toolsConfig = effectiveToolsConfig()) {{
+      if (isOrcaConfigured(toolsConfig)) {{
+        return "Export To OrcaSlicer";
+      }}
+      if (hasConfiguredSlicer(toolsConfig)) {{
+        return "Export To Slicer";
+      }}
+      return "Export Binary STL";
+    }}
+
+    function stlOpenButtonLabel(toolsConfig = effectiveToolsConfig()) {{
+      return isOrcaConfigured(toolsConfig) ? "Open In OrcaSlicer" : "Open In Slicer";
+    }}
+
+    function slicerDisplayName(slicerPath = effectiveToolsConfig().slicerBin || "") {{
+      if (!slicerPath) {{
+        return "the slicer";
+      }}
+      const parts = slicerPath.split(/[\\\\/]/).filter(Boolean);
+      const fileName = parts.length ? parts[parts.length - 1] : slicerPath;
+      return /orca/i.test(fileName) ? "OrcaSlicer" : fileName;
+    }}
+
+    function saveRescanButtonLabel(config = editableConfig || {{ ai: payload.ai || {{}} }}) {{
+      return config?.ai?.enabled ? "Save And Rescan + AI" : "Save And Rescan";
+    }}
+
+    function saveForceRescanButtonLabel(config = editableConfig || {{ ai: payload.ai || {{}} }}) {{
+      return config?.ai?.enabled ? "Save And Force Rebuild + AI" : "Save And Force Rebuild";
+    }}
+
+    function refreshConfiguredLabels(config = editableConfig) {{
+      const toolsConfig = config?.tools || effectiveToolsConfig();
+      exportStlBtn.textContent = exportButtonLabel(toolsConfig);
+      saveRescanBtn.textContent = saveRescanButtonLabel(config || {{ ai: payload.ai || {{}} }});
+      saveForceRescanBtn.textContent = saveForceRescanButtonLabel(config || {{ ai: payload.ai || {{}} }});
+    }}
+
     function splitPaths(text) {{
       return text
         .split(/\\n|,/)
@@ -1698,6 +2455,122 @@ def html_template(payload: dict[str, Any]) -> str:
 
     function renderSettingsList() {{
       settingsList.innerHTML = "";
+      editableConfig.tools ||= blankToolsConfig();
+      const toolsCard = document.createElement("section");
+      toolsCard.className = "settings-card";
+      const toolsHeading = document.createElement("h3");
+      toolsHeading.textContent = "Tool Paths";
+      toolsCard.appendChild(toolsHeading);
+      const toolsFields = document.createElement("div");
+      toolsFields.className = "fields";
+      const toolDefinitions = [
+        [
+          "openscadBin",
+          "OpenSCAD Executable",
+          editableConfig.tools.openscadBin || "openscad-nightly",
+          "Full path or command name used for metadata export, preview rendering, STL export, and OpenSCAD launch.",
+        ],
+        [
+          "slicerBin",
+          "Slicer Executable",
+          editableConfig.tools.slicerBin || "",
+          "Optional full path or command name for OrcaSlicer or another slicer. Leave blank to disable slicer launch.",
+        ],
+      ];
+      for (const [key, labelText, value, helpText] of toolDefinitions) {{
+        const field = document.createElement("div");
+        field.className = "field";
+        const label = document.createElement("label");
+        label.textContent = labelText;
+        field.appendChild(label);
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = value;
+        input.addEventListener("input", () => {{
+          editableConfig.tools[key] = input.value;
+          refreshConfiguredLabels(editableConfig);
+        }});
+        field.appendChild(input);
+        const help = document.createElement("div");
+        help.className = "field-help";
+        help.textContent = helpText;
+        field.appendChild(help);
+        toolsFields.appendChild(field);
+      }}
+      toolsCard.appendChild(toolsFields);
+      settingsList.appendChild(toolsCard);
+
+      const aiCard = document.createElement("section");
+      aiCard.className = "settings-card";
+      const aiHeading = document.createElement("h3");
+      aiHeading.textContent = "Optional AI Enrichment";
+      aiCard.appendChild(aiHeading);
+      const aiFields = document.createElement("div");
+      aiFields.className = "fields";
+      editableConfig.ai ||= blankAiConfig();
+
+      const aiTextFields = [
+        ["provider", "Provider", editableConfig.ai.provider || "ollama"],
+        ["baseUrl", "Base URL", editableConfig.ai.baseUrl || "http://127.0.0.1:11434"],
+        ["model", "Model", editableConfig.ai.model || "qwen3:4b-instruct"],
+        ["timeout", "Timeout Seconds", String(editableConfig.ai.timeout ?? 30)],
+        ["maxSourceChars", "Max Source Chars", String(editableConfig.ai.maxSourceChars ?? 12000)],
+        ["maxCommentChars", "Max Comment Chars", String(editableConfig.ai.maxCommentChars ?? 3000)],
+      ];
+      for (const [key, labelText, value] of aiTextFields) {{
+        const field = document.createElement("div");
+        field.className = "field";
+        const label = document.createElement("label");
+        label.textContent = labelText;
+        field.appendChild(label);
+        const input = document.createElement("input");
+        input.type = key === "timeout" || key === "maxSourceChars" || key === "maxCommentChars" ? "number" : "text";
+        if (input.type === "number") {{
+          input.min = "1";
+        }}
+        input.value = value;
+        input.addEventListener("input", () => {{
+          if (input.type === "number") {{
+            editableConfig.ai[key] = input.value === "" ? "" : Number(input.value);
+          }} else {{
+            editableConfig.ai[key] = input.value;
+          }}
+          refreshConfiguredLabels(editableConfig);
+        }});
+        field.appendChild(input);
+        aiFields.appendChild(field);
+      }}
+
+      const aiToggles = [
+        ["enabled", "Enable AI enrichment at index time"],
+        ["includeScad", "Allow AI enrichment for SCAD entries"],
+        ["includeStl", "Allow AI enrichment for STL entries"],
+      ];
+      for (const [key, labelText] of aiToggles) {{
+        const wrapper = document.createElement("label");
+        wrapper.className = "checkbox-row";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = Boolean(editableConfig.ai[key]);
+        input.addEventListener("change", () => {{
+          editableConfig.ai[key] = input.checked;
+          refreshConfiguredLabels(editableConfig);
+        }});
+        const span = document.createElement("span");
+        span.textContent = labelText;
+        wrapper.appendChild(input);
+        wrapper.appendChild(span);
+        aiFields.appendChild(wrapper);
+      }}
+      const aiHelp = document.createElement("div");
+      aiHelp.className = "small-note";
+      aiHelp.textContent =
+        "AI enrichment is optional. If Ollama is disabled, missing, or the model is unavailable, indexing falls back to the normal non-AI behavior.";
+      aiFields.appendChild(aiHelp);
+      aiCard.appendChild(aiFields);
+      settingsList.appendChild(aiCard);
+      refreshConfiguredLabels(editableConfig);
+
       const sources = editableConfig?.sources || [];
       sources.forEach((source, index) => {{
         const card = document.createElement("section");
@@ -1812,6 +2685,12 @@ def html_template(payload: dict[str, Any]) -> str:
         throw new Error(data.error || "Failed to load config");
       }}
       editableConfig = structuredClone(data.config);
+      editableConfig.tools = {{
+        ...blankToolsConfig(),
+        ...(data.effectiveTools || {{}}),
+        ...(editableConfig.tools || {{}}),
+      }};
+      editableConfig.ai ||= blankAiConfig();
       configPath = data.configPath;
       configPathNote.textContent = `Editing ${{configPath}}`;
       renderSettingsList();
@@ -1844,32 +2723,15 @@ def html_template(payload: dict[str, Any]) -> str:
       return data;
     }}
 
-    async function triggerRescan() {{
-      updateSettingsStatus("Rescanning libraries...", "");
-      const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{}});
+    async function triggerRescan(force = false) {{
+      updateSettingsStatus(force ? "Force rebuilding libraries..." : "Rescanning libraries...", "");
+      const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{ force }});
       updateSettingsStatus(
-        `Rescan complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
+        `${{data.forced ? "Force rebuild" : "Rescan"}} complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
         "success"
       );
       window.setTimeout(() => window.location.reload(), 600);
       return data;
-    }}
-
-    async function rescanOnly() {{
-      if (!serverAvailable) {{
-        return;
-      }}
-      updateStatus("Rescanning libraries...", "");
-      try {{
-        const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{}});
-        updateStatus(
-          `Rescan complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
-          "success"
-        );
-        window.setTimeout(() => window.location.reload(), 600);
-      }} catch (error) {{
-        updateStatus(error.message, "error");
-      }}
     }}
 
     searchInput.addEventListener("input", applyFilters);
@@ -1881,11 +2743,10 @@ def html_template(payload: dict[str, Any]) -> str:
     exportStlBtn.addEventListener("click", exportBinaryStl);
     openScadBtn.addEventListener("click", openInOpenScad);
     copyCommandBtn.addEventListener("click", copyCommand);
-    rescanBtn.addEventListener("click", rescanOnly);
     settingsBtn.addEventListener("click", openSettings);
     addSourceBtn.addEventListener("click", () => {{
       if (!editableConfig) {{
-        editableConfig = {{ sources: [] }};
+        editableConfig = {{ tools: blankToolsConfig(), ai: blankAiConfig(), sources: [] }};
       }}
       editableConfig.sources.push(blankSource());
       renderSettingsList();
@@ -1893,6 +2754,7 @@ def html_template(payload: dict[str, Any]) -> str:
     saveSettingsBtn.addEventListener("click", async () => {{
       try {{
         await saveConfig();
+        refreshConfiguredLabels(editableConfig);
       }} catch (error) {{
         updateSettingsStatus(error.message, "error");
       }}
@@ -1900,7 +2762,15 @@ def html_template(payload: dict[str, Any]) -> str:
     saveRescanBtn.addEventListener("click", async () => {{
       try {{
         await saveConfig();
-        await triggerRescan();
+        await triggerRescan(false);
+      }} catch (error) {{
+        updateSettingsStatus(error.message, "error");
+      }}
+    }});
+    saveForceRescanBtn.addEventListener("click", async () => {{
+      try {{
+        await saveConfig();
+        await triggerRescan(true);
       }} catch (error) {{
         updateSettingsStatus(error.message, "error");
       }}
@@ -1940,9 +2810,15 @@ def html_template(payload: dict[str, Any]) -> str:
     }});
 
     footer.textContent =
-      `Generated ${{payload.generatedAt}} using ${{payload.openscadBin}} across ${{payload.sources.length}} configured source libraries. ` +
-      `Run the local server for custom preview renders and binary STL exports.`;
+      `Generated ${{payload.generatedAt}} using ${{payload.openscadBin}} across ${{payload.sources.length}} configured source libraries.` +
+      (aiMetadata?.enabled
+        ? aiMetadata.available
+          ? ` AI enrichments came from ${{aiMetadata.provider}}:${{aiMetadata.model}}.`
+          : ` AI was enabled but skipped: ${{aiMetadata.reason}}.`
+        : "") +
+      ` Run the local server for custom preview renders and binary STL exports.`;
 
+    refreshConfiguredLabels();
     setActiveTab("scad");
     detectServer();
   </script>
@@ -1960,6 +2836,8 @@ def build_payload(
     args: argparse.Namespace,
     sources: list[SourceConfig],
     workspace_root: Path,
+    ai_state: AIState,
+    tool_config: ToolConfig,
 ) -> dict[str, Any]:
     index_records = []
     for entry in entries:
@@ -1970,11 +2848,24 @@ def build_payload(
 
     return {
         "generatedAt": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "openscadBin": args.openscad_bin,
+        "openscadBin": tool_config.openscad_bin,
         "workspaceRoot": str(workspace_root),
         "catalogDir": args.output_dir,
         "pathSeparator": os.pathsep,
         "serverBasePath": "/api",
+        "tools": {
+            "openscadBin": tool_config.openscad_bin,
+            "slicerBin": tool_config.slicer_bin,
+            "hasSlicer": bool(tool_config.slicer_bin),
+        },
+        "ai": {
+            "enabled": ai_state.enabled,
+            "available": ai_state.available,
+            "provider": ai_state.provider,
+            "baseUrl": ai_state.base_url,
+            "model": ai_state.model,
+            "reason": ai_state.reason,
+        },
         "sources": [
             {
                 "id": source.id,
@@ -1994,11 +2885,21 @@ def main() -> int:
     args = parse_args()
     workspace_root = Path.cwd().resolve()
     output_dir = (workspace_root / args.output_dir).resolve()
-    sources = load_sources(args, workspace_root)
+    sources, ai_config, tool_config = load_sources(args, workspace_root)
+    args.openscad_bin = tool_config.openscad_bin
 
     metadata_dir = output_dir / "metadata"
     preview_dir = output_dir / "previews"
+    ai_dir = output_dir / "ai"
     output_dir.mkdir(parents=True, exist_ok=True)
+    ai_state = probe_ai(ai_config)
+    if ai_state.enabled and ai_state.available:
+        print(
+            f"AI enrichment enabled via {ai_state.provider} model {ai_state.model} at {ai_state.base_url}",
+            file=sys.stderr,
+        )
+    elif ai_state.enabled and ai_state.reason:
+        print(f"AI enrichment skipped: {ai_state.reason}", file=sys.stderr)
 
     source_file_pairs = [
         (source, source_path)
@@ -2023,12 +2924,15 @@ def main() -> int:
             output_dir=output_dir,
             metadata_dir=metadata_dir,
             preview_dir=preview_dir,
+            ai_dir=ai_dir,
             args=args,
             workspace_root=workspace_root,
+            ai_config=ai_config,
+            ai_state=ai_state,
         )
         entries.append(entry)
 
-    payload = build_payload(entries, args, sources, workspace_root)
+    payload = build_payload(entries, args, sources, workspace_root, ai_state, tool_config)
     write_catalog_json(output_dir, payload)
     write_catalog_html(output_dir, payload)
 
