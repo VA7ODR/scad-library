@@ -8,16 +8,21 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from functools import partial
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 DEFAULT_BIND = "127.0.0.1"
@@ -26,9 +31,94 @@ DEFAULT_CATALOG_DIR = ".catalog"
 DEFAULT_OPENSCAD_BIN = "openscad-nightly"
 DEFAULT_SLICER_BIN = ""
 DEFAULT_CONFIG_PATH = "sources.json"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct"
+DEFAULT_AI_TIMEOUT = 30
 SCAD_FILE_EXTENSION = ".scad"
 BAKED_FILE_EXTENSIONS = {".stl", ".3mf"}
 SUPPORTED_SOURCE_TYPES = {"scad", "stl", "mixed", "auto"}
+ASSISTANT_MAX_CANDIDATES = 24
+ASSISTANT_MAX_MESSAGES = 8
+ASSISTANT_MAX_MESSAGE_CHARS = 600
+SEARCH_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "from",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "them",
+    "this",
+    "to",
+    "use",
+    "using",
+    "want",
+    "what",
+    "with",
+}
+QUERY_EXPANSIONS = {
+    "hold": ["holder", "hook", "shelf", "tray", "mount", "bracket", "clamp", "channel"],
+    "holding": ["holder", "hook", "shelf", "tray", "mount", "bracket", "clamp"],
+    "mount": ["mount", "holder", "bracket", "hook", "shelf", "tray", "channel"],
+    "mounted": ["mount", "holder", "bracket", "hook", "shelf", "tray"],
+    "kvm": ["holder", "shelf", "tray", "mount", "device", "cable"],
+    "cable": ["cable", "channel", "loop", "hook", "clip", "holder"],
+    "desk": ["desk", "underware", "shelf", "mount"],
+    "under": ["underware", "mount", "hook", "holder"],
+}
+GENERIC_ASSISTANT_PHRASES = (
+    "structured summary",
+    "comprehensive list",
+    "product catalog",
+    "documentation",
+    "purchasing",
+    "key components",
+    "ecosystem components summary",
+)
+PARAMETER_REASON_HINTS = (
+    ("width", "Adjust width for device size or side clearance."),
+    ("length", "Adjust length for front-to-back support."),
+    ("depth", "Adjust depth for front-to-back support."),
+    ("height", "Adjust height or drop for clearance."),
+    ("wall", "Increase wall size if you need more stiffness."),
+    ("thickness", "Increase thickness if you need more stiffness."),
+    ("cutout", "Tune cable cutouts for routing and access."),
+    ("cable", "Tune cable-related openings or routing."),
+    ("offset", "Adjust offset to fit around nearby surfaces."),
+    ("connector", "Tune connector fit or attachment details."),
+    ("hook", "Tune hook geometry for grip and clearance."),
+    ("count", "Adjust the count to match your routing or attachment needs."),
+)
+RESCAN_STATUS_LOCK = threading.Lock()
+RESCAN_STATUS: dict[str, Any] = {
+    "active": False,
+    "forced": False,
+    "startedAt": None,
+    "finishedAt": None,
+    "current": 0,
+    "total": 0,
+    "lastLine": "",
+    "error": None,
+    "command": "",
+    "sourceCount": 0,
+    "entryCount": 0,
+    "pid": None,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +244,267 @@ def normalize_tool_text(value: Any, *, allow_empty: bool = False) -> str:
     return text
 
 
+def collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_rescan_progress(line: str) -> tuple[int, int] | None:
+    match = re.search(r"\[(\d+)/(\d+)\]", line)
+    if not match:
+        return None
+    current = int(match.group(1))
+    total = int(match.group(2))
+    return current, total
+
+
+def current_rescan_status() -> dict[str, Any]:
+    with RESCAN_STATUS_LOCK:
+        status = dict(RESCAN_STATUS)
+    total = status.get("total", 0) or 0
+    current = status.get("current", 0) or 0
+    status["progressPercent"] = round((current / total) * 100, 1) if total > 0 else 0
+    return status
+
+
+def update_rescan_status(**updates: Any) -> None:
+    with RESCAN_STATUS_LOCK:
+        RESCAN_STATUS.update(updates)
+
+
+def normalize_ai_text(value: Any, default: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return default
+    return value.strip()
+
+
+def normalize_ai_timeout(value: Any, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return default
+    return value
+
+
+def ollama_request(
+    *,
+    base_url: str,
+    timeout_seconds: int,
+    endpoint: str,
+    payload: dict[str, Any] | None = None,
+    method: str = "POST",
+) -> dict[str, Any]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib_request.Request(
+        f"{base_url}{endpoint}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except urllib_error.URLError as exc:
+        reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
+        raise RuntimeError(reason) from exc
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ollama returned invalid JSON: {exc}") from exc
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+        raise RuntimeError(parsed["error"])
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Ollama returned an unexpected response payload.")
+    return parsed
+
+
+def assistant_messages_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    raw_messages = payload.get("messages", [])
+    if not isinstance(raw_messages, list):
+        raise ValueError("Assistant payload field 'messages' must be an array.")
+    normalized: list[dict[str, str]] = []
+    for item in raw_messages[-ASSISTANT_MAX_MESSAGES:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        text = collapse_whitespace(content)[:ASSISTANT_MAX_MESSAGE_CHARS]
+        if not text:
+            continue
+        normalized.append({"role": role, "content": text})
+    if not normalized:
+        raise ValueError("Assistant request is missing any valid chat messages.")
+    return normalized
+
+
+def tokenize_search_text(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) >= 2]
+
+
+def expanded_search_tokens(tokens: list[str]) -> list[tuple[str, float]]:
+    weighted: list[tuple[str, float]] = []
+    seen: set[tuple[str, float]] = set()
+    for token in tokens:
+        key = (token, 1.0)
+        if key not in seen:
+            weighted.append(key)
+            seen.add(key)
+        for extra in QUERY_EXPANSIONS.get(token, []):
+            extra_key = (extra, 0.45)
+            if extra_key not in seen:
+                weighted.append(extra_key)
+                seen.add(extra_key)
+    return weighted
+
+
+def build_assistant_candidate(entry: dict[str, Any]) -> dict[str, Any]:
+    ai_payload = entry.get("ai") if isinstance(entry.get("ai"), dict) else {}
+    parameter_hints = (
+        ai_payload.get("parameterHints") if isinstance(ai_payload, dict) else {}
+    )
+    if not isinstance(parameter_hints, dict):
+        parameter_hints = {}
+    parameters: list[dict[str, Any]] = []
+    raw_parameters = entry.get("parameters", [])
+    if isinstance(raw_parameters, list):
+        for parameter in raw_parameters[:16]:
+            if not isinstance(parameter, dict):
+                continue
+            name = parameter.get("name")
+            if not isinstance(name, str):
+                continue
+            hint = parameter_hints.get(name) if isinstance(parameter_hints.get(name), dict) else {}
+            option_names: list[str] = []
+            raw_options = parameter.get("options", [])
+            if isinstance(raw_options, list):
+                for option in raw_options[:8]:
+                    if isinstance(option, dict) and isinstance(option.get("name"), str):
+                        option_names.append(option["name"])
+            parameters.append(
+                {
+                    "name": name,
+                    "label": hint.get("label") if isinstance(hint.get("label"), str) else name,
+                    "type": parameter.get("type"),
+                    "caption": parameter.get("caption"),
+                    "options": option_names,
+                }
+            )
+    return {
+        "id": entry.get("id"),
+        "title": entry.get("title"),
+        "entryType": entry.get("entryType"),
+        "fileFormat": entry.get("fileFormat"),
+        "sourceName": entry.get("sourceName"),
+        "category": entry.get("category"),
+        "relativePath": entry.get("relativePath"),
+        "parameterCount": entry.get("parameterCount", 0),
+        "groupNames": entry.get("groupNames", [])[:6],
+        "parameterNames": entry.get("parameterNames", [])[:8],
+        "summary": ai_payload.get("summary") if isinstance(ai_payload, dict) else None,
+        "useCases": ai_payload.get("useCases", [])[:4] if isinstance(ai_payload, dict) else [],
+        "searchTerms": ai_payload.get("searchTerms", [])[:8] if isinstance(ai_payload, dict) else [],
+        "parameters": parameters,
+    }
+
+
+def candidate_score(entry: dict[str, Any], query: str, tokens: list[str], current_tab: str) -> float:
+    search_text = str(entry.get("searchText", ""))
+    title = str(entry.get("title", "")).lower()
+    source_name = str(entry.get("sourceName", "")).lower()
+    category = str(entry.get("category", "")).lower()
+    relative_path = str(entry.get("relativePath", "")).lower()
+    group_names = " ".join(str(item).lower() for item in entry.get("groupNames", []))
+    parameter_names = " ".join(str(item).lower() for item in entry.get("parameterNames", []))
+    score = 0.0
+    lower_query = query.lower()
+    if lower_query and lower_query in search_text:
+        score += 12.0
+    if lower_query and lower_query in title:
+        score += 8.0
+    for token, weight in expanded_search_tokens(tokens):
+        if token in title:
+            score += 4.0 * weight
+        if token in source_name:
+            score += 2.5 * weight
+        if token in category:
+            score += 2.0 * weight
+        if token in relative_path:
+            score += 1.5 * weight
+        if token in group_names:
+            score += 1.3 * weight
+        if token in parameter_names:
+            score += 1.1 * weight
+        if token in search_text:
+            score += 1.0 * weight
+    if current_tab and entry.get("entryType") == current_tab:
+        score += 6.0
+    if entry.get("entryType") == "scad":
+        score += 0.25
+    return score
+
+
+def normalize_assistant_response(
+    raw: dict[str, Any],
+    candidates_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    reply = collapse_whitespace(str(raw.get("reply", "")))[:900]
+    follow_up = collapse_whitespace(str(raw.get("followUp", "")))[:220]
+    matches: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in raw.get("matches", []):
+        if not isinstance(item, dict):
+            continue
+        entry_id = item.get("id")
+        if (
+            not isinstance(entry_id, str)
+            or entry_id not in candidates_by_id
+            or entry_id in seen_ids
+        ):
+            continue
+        seen_ids.add(entry_id)
+        entry = candidates_by_id[entry_id]
+        valid_names = {
+            parameter.get("name")
+            for parameter in entry.get("parameters", [])
+            if isinstance(parameter, dict) and isinstance(parameter.get("name"), str)
+        }
+        suggested_parameters: list[dict[str, str]] = []
+        for suggestion in item.get("suggestedParameters", []):
+            if not isinstance(suggestion, dict):
+                continue
+            name = suggestion.get("name")
+            if not isinstance(name, str) or name not in valid_names:
+                continue
+            reason = collapse_whitespace(str(suggestion.get("reason", "")))[:180]
+            suggested_value = collapse_whitespace(str(suggestion.get("suggestedValue", "")))[:120]
+            suggested_parameters.append(
+                {
+                    "name": name,
+                    "reason": reason,
+                    "suggestedValue": suggested_value,
+                }
+            )
+        matches.append(
+            {
+                "id": entry_id,
+                "reason": collapse_whitespace(str(item.get("reason", "")))[:220],
+                "suggestedParameters": suggested_parameters[:4],
+            }
+        )
+    return {
+        "reply": reply,
+        "followUp": follow_up,
+        "matches": matches[:8],
+    }
+
+
 class CatalogRequestHandler(SimpleHTTPRequestHandler):
     def __init__(
         self,
@@ -181,10 +532,20 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.send_json(HTTPStatus.OK, {"ok": True})
+            status = current_rescan_status()
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "rescanActive": bool(status.get("active")),
+                },
+            )
             return
         if parsed.path == "/api/config":
             self.handle_get_config()
+            return
+        if parsed.path == "/api/rescan-status":
+            self.handle_rescan_status()
             return
         if parsed.path.startswith("/api/source-file/"):
             entry_id = parsed.path.removeprefix("/api/source-file/")
@@ -199,6 +560,9 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/config":
             self.handle_save_config()
+            return
+        if parsed.path == "/api/assistant":
+            self.handle_assistant()
             return
         if parsed.path not in {
             "/api/render-preview",
@@ -220,7 +584,6 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid JSON body"})
             return
-
         entry_id = payload.get("entryId")
         parameters = payload.get("parameters", {})
         if not isinstance(entry_id, str) or not isinstance(parameters, dict):
@@ -297,6 +660,21 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         return {
             "openscadBin": normalize_tool_text(openscad_bin),
             "slicerBin": normalize_tool_text(slicer_bin, allow_empty=True),
+        }
+
+    def effective_ai(self) -> dict[str, Any]:
+        payload = self.config_payload()
+        raw_ai = payload.get("ai", {})
+        if raw_ai is None:
+            raw_ai = {}
+        if not isinstance(raw_ai, dict):
+            raise ValueError("Top-level 'ai' config must be an object.")
+        return {
+            "enabled": bool(raw_ai.get("enabled", False)),
+            "provider": normalize_ai_text(raw_ai.get("provider"), "ollama"),
+            "baseUrl": normalize_ai_text(raw_ai.get("baseUrl"), DEFAULT_OLLAMA_URL),
+            "model": normalize_ai_text(raw_ai.get("model"), DEFAULT_OLLAMA_MODEL),
+            "timeout": normalize_ai_timeout(raw_ai.get("timeout"), DEFAULT_AI_TIMEOUT),
         }
 
     def validate_config_payload(self, payload: dict[str, Any]) -> None:
@@ -511,6 +889,310 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             },
         )
 
+    def handle_rescan_status(self) -> None:
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "status": current_rescan_status(),
+            },
+        )
+
+    def assistant_candidates(
+        self,
+        *,
+        query: str,
+        current_tab: str,
+    ) -> list[dict[str, Any]]:
+        entries = list(self.load_catalog_index().values())
+        lower_query = query.lower()
+        hinted_sources = {
+            str(entry.get("sourceName", ""))
+            for entry in entries
+            if isinstance(entry.get("sourceName"), str)
+            and entry.get("sourceName")
+            and str(entry.get("sourceName")).lower() in lower_query
+        }
+        if hinted_sources:
+            entries = [entry for entry in entries if entry.get("sourceName") in hinted_sources]
+        source_tokens = {
+            token
+            for source_name in hinted_sources
+            for token in tokenize_search_text(source_name)
+        }
+        tokens = [
+            token
+            for token in tokenize_search_text(query)
+            if token not in SEARCH_STOP_WORDS and token not in source_tokens
+        ]
+        if not tokens:
+            tokens = [
+                token for token in tokenize_search_text(query) if token not in SEARCH_STOP_WORDS
+            ]
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for entry in entries:
+            score = candidate_score(entry, query, tokens, current_tab)
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                str(item[1].get("title", "")),
+                str(item[1].get("relativePath", "")),
+            )
+        )
+        if not scored:
+            scored = [(0.0, entry) for entry in entries[:ASSISTANT_MAX_CANDIDATES]]
+        return [entry for _score, entry in scored[:ASSISTANT_MAX_CANDIDATES]]
+
+    def fallback_assistant_reply(
+        self,
+        *,
+        query: str,
+        candidates: list[dict[str, Any]],
+        ai_state: dict[str, Any],
+        current_tab: str,
+    ) -> dict[str, Any]:
+        if current_tab == "scad":
+            scad_candidates = [entry for entry in candidates if entry.get("entryType") == "scad"]
+            if scad_candidates:
+                baked_candidates = [entry for entry in candidates if entry.get("entryType") != "scad"]
+                candidates = scad_candidates + baked_candidates
+        top_matches = []
+        for entry in candidates[:6]:
+            suggested_parameters: list[dict[str, str]] = []
+            for parameter in entry.get("parameters", []):
+                if not isinstance(parameter, dict) or not isinstance(parameter.get("name"), str):
+                    continue
+                lower_name = parameter["name"].lower()
+                for key, reason in PARAMETER_REASON_HINTS:
+                    if key in lower_name:
+                        suggested_parameters.append(
+                            {
+                                "name": parameter["name"],
+                                "reason": reason,
+                                "suggestedValue": "",
+                            }
+                        )
+                        break
+                if len(suggested_parameters) >= 4:
+                    break
+            reason_parts = [f"{entry.get('sourceName')} / {entry.get('category')}"]
+            ai_payload = entry.get("ai")
+            if isinstance(ai_payload, dict) and isinstance(ai_payload.get("summary"), str):
+                reason_parts.append(ai_payload["summary"])
+            elif entry.get("entryType") == "scad":
+                reason_parts.append(
+                    f"{entry.get('parameterCount', 0)} parameters across {len(entry.get('groupNames', []))} groups."
+                )
+            else:
+                file_format = str(entry.get("fileFormat", "")).upper() or "baked"
+                reason_parts.append(f"{file_format} baked object.")
+            top_matches.append(
+                {
+                    "id": entry.get("id"),
+                    "reason": " ".join(reason_parts)[:220],
+                    "suggestedParameters": suggested_parameters,
+                }
+            )
+        ai_note = (
+            "Ollama search suggestions are unavailable right now."
+            if not ai_state.get("enabled")
+            else "These are grounded local catalog matches because Ollama did not return a trustworthy ranked answer."
+        )
+        return {
+            "reply": (
+                f"Here are the closest local catalog matches I could find for '{query}'. "
+                f"{ai_note}"
+            )[:900],
+            "followUp": "Open one of the customizable entries to review parameters and adjust dimensions.",
+            "matches": top_matches,
+            "assistantUsed": False,
+        }
+
+    def ollama_assistant_reply(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        candidates: list[dict[str, Any]],
+        ai_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        compact_candidates = [build_assistant_candidate(entry) for entry in candidates]
+        candidate_ids = [item["id"] for item in compact_candidates if isinstance(item.get("id"), str)]
+        candidates_by_id = {
+            entry["id"]: entry
+            for entry in candidates
+            if isinstance(entry.get("id"), str) and entry.get("id") in candidate_ids
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "reply": {"type": "string"},
+                "followUp": {"type": "string"},
+                "matches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "suggestedParameters": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "suggestedValue": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                    "required": ["name", "suggestedValue", "reason"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["id", "reason", "suggestedParameters"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["reply", "followUp", "matches"],
+            "additionalProperties": False,
+        }
+        system_prompt = (
+            "You are a grounded assistant for a local OpenSCAD catalog. "
+            "Use only the supplied catalog candidates and chat history. "
+            "Do not invent files, dimensions, load ratings, or print guarantees. "
+            "Answer the user's request directly instead of summarizing the dataset. "
+            "Prefer concrete part suggestions over abstract categorization. "
+            "If the user wants to hold or mount an object, prefer holders, shelves, hooks, trays, "
+            "mounts, brackets, channels, or customizable device-support parts over generic variants. "
+            "Recommend parameter names only if they already exist on a candidate entry. "
+            "Suggested values must be framed as starting points, not facts."
+        )
+        prompt = (
+            "Given the conversation and the candidate catalog entries, return concise JSON.\n"
+            "Requirements:\n"
+            "- reply: short helpful answer grounded in the candidates\n"
+            "- followUp: one short next-step suggestion\n"
+            "- matches: 3 to 8 best candidates\n"
+            "- each match.reason should explain why it fits the request\n"
+            "- suggestedParameters should only reference real parameter names from that entry\n"
+            "- only suggest parameter changes when they seem genuinely relevant\n\n"
+            f"Conversation:\n{json.dumps(messages, indent=2)}\n\n"
+            f"Candidates:\n{json.dumps(compact_candidates, indent=2)}"
+        )
+        response = ollama_request(
+            base_url=ai_state["baseUrl"],
+            timeout_seconds=ai_state["timeout"],
+            endpoint="/api/generate",
+            payload={
+                "model": ai_state["model"],
+                "system": system_prompt,
+                "prompt": prompt,
+                "format": schema,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.2},
+            },
+        )
+        response_text = response.get("response")
+        if not isinstance(response_text, str) or not response_text.strip():
+            raise RuntimeError("Assistant returned an empty response.")
+        try:
+            raw = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Assistant returned invalid JSON: {exc}") from exc
+        normalized = normalize_assistant_response(
+            raw if isinstance(raw, dict) else {},
+            candidates_by_id,
+        )
+        reply_lower = normalized["reply"].lower()
+        if (
+            not normalized["matches"]
+            or any(phrase in reply_lower for phrase in GENERIC_ASSISTANT_PHRASES)
+        ):
+            raise RuntimeError("Assistant response was too generic to trust.")
+        normalized["assistantUsed"] = True
+        return normalized
+
+    def handle_assistant(self) -> None:
+        length_header = self.headers.get("Content-Length")
+        if not length_header:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Missing request body"})
+            return
+        try:
+            content_length = int(length_header)
+            payload = json.loads(self.rfile.read(content_length))
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid JSON body"})
+            return
+        if not isinstance(payload, dict):
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "Assistant payload must be a JSON object."},
+            )
+            return
+        try:
+            messages = assistant_messages_from_payload(payload)
+            ai_state = self.effective_ai()
+            current_tab = str(payload.get("currentTab", "")).strip().lower()
+            if current_tab not in {"scad", "baked"}:
+                current_tab = ""
+            latest_user_message = next(
+                (item["content"] for item in reversed(messages) if item["role"] == "user"),
+                "",
+            )
+            candidates = self.assistant_candidates(query=latest_user_message, current_tab=current_tab)
+            if ai_state["enabled"] and ai_state["provider"] == "ollama":
+                assistant_payload = self.ollama_assistant_reply(
+                    messages=messages,
+                    candidates=candidates,
+                    ai_state=ai_state,
+                )
+            else:
+                assistant_payload = self.fallback_assistant_reply(
+                    query=latest_user_message,
+                    candidates=candidates,
+                    ai_state=ai_state,
+                    current_tab=current_tab,
+                )
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+        except RuntimeError as exc:
+            try:
+                ai_state = self.effective_ai()
+                latest_user_message = next(
+                    (item["content"] for item in reversed(messages) if item["role"] == "user"),
+                    "",
+                )
+                current_tab = str(payload.get("currentTab", "")).strip().lower()
+                if current_tab not in {"scad", "baked"}:
+                    current_tab = ""
+                candidates = self.assistant_candidates(query=latest_user_message, current_tab=current_tab)
+                assistant_payload = self.fallback_assistant_reply(
+                    query=latest_user_message,
+                    candidates=candidates,
+                    ai_state=ai_state,
+                    current_tab=current_tab,
+                )
+                assistant_payload["reply"] = (
+                    f"{assistant_payload['reply']} Ollama error: {collapse_whitespace(str(exc))[:220]}"
+                )[:900]
+            except Exception:
+                self.send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": collapse_whitespace(str(exc))[:260]},
+                )
+                return
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                **assistant_payload,
+            },
+        )
+
     def handle_save_config(self) -> None:
         length_header = self.headers.get("Content-Length")
         if not length_header:
@@ -580,39 +1262,124 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         ]
         if force:
             command.append("--force")
-        result = subprocess.run(
-            command,
-            cwd=self.workspace_root,
-            capture_output=True,
-            text=True,
-            timeout=max(self.timeout_seconds * 10, self.timeout_seconds),
-            check=False,
-        )
-        if result.returncode != 0:
+        rendered_command = " ".join(shlex.quote(part) for part in command)
+        current_status = current_rescan_status()
+        if current_status.get("active"):
             self.send_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.OK,
                 {
-                    "ok": False,
-                    "error": compact_error(result),
-                    "command": " ".join(shlex.quote(part) for part in command),
+                    "ok": True,
+                    "started": False,
+                    "alreadyRunning": True,
+                    "status": current_status,
                 },
             )
             return
         try:
-            catalog = self.load_catalog_index()
             source_count = len(self.config_payload().get("sources", []))
         except ValueError:
-            catalog = {}
             source_count = 0
+        update_rescan_status(
+            active=True,
+            forced=force,
+            startedAt=utc_timestamp(),
+            finishedAt=None,
+            current=0,
+            total=0,
+            lastLine="Starting rescan...",
+            error=None,
+            command=rendered_command,
+            sourceCount=source_count,
+            entryCount=0,
+            pid=None,
+        )
+        worker = threading.Thread(
+            target=self.run_rescan_job,
+            args=(command, force, rendered_command),
+            daemon=True,
+        )
+        worker.start()
         self.send_json(
             HTTPStatus.OK,
             {
                 "ok": True,
-                "entryCount": len(catalog),
-                "sourceCount": source_count,
+                "started": True,
+                "alreadyRunning": False,
                 "forced": force,
-                "command": " ".join(shlex.quote(part) for part in command),
+                "command": rendered_command,
+                "status": current_rescan_status(),
             },
+        )
+
+    def run_rescan_job(self, command: list[str], force: bool, rendered_command: str) -> None:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=self.workspace_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            update_rescan_status(
+                active=False,
+                forced=force,
+                finishedAt=utc_timestamp(),
+                current=0,
+                total=0,
+                lastLine="Rescan failed to start.",
+                error=collapse_whitespace(str(exc)) or "Rescan failed to start.",
+                command=rendered_command,
+                pid=None,
+            )
+            return
+        update_rescan_status(pid=process.pid)
+        captured_lines: list[str] = []
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            captured_lines.append(line)
+            progress = parse_rescan_progress(line)
+            updates: dict[str, Any] = {"lastLine": line}
+            if progress is not None:
+                updates["current"], updates["total"] = progress
+            update_rescan_status(**updates)
+        return_code = process.wait()
+        error_text = None
+        entry_count = 0
+        final_status = current_rescan_status()
+        source_count = final_status.get("sourceCount", 0)
+        last_line = captured_lines[-1] if captured_lines else ""
+        if return_code != 0:
+            error_text = collapse_whitespace(" | ".join(captured_lines[-8:]))[:400]
+            if not error_text:
+                error_text = f"Rescan failed with exit code {return_code}."
+        else:
+            try:
+                catalog = self.load_catalog_index()
+                entry_count = len(catalog)
+                source_count = len(self.config_payload().get("sources", []))
+            except ValueError:
+                entry_count = 0
+        completed_current = final_status.get("current", 0)
+        completed_total = final_status.get("total", 0)
+        if return_code == 0 and completed_total > 0:
+            completed_current = completed_total
+        update_rescan_status(
+            active=False,
+            forced=force,
+            finishedAt=utc_timestamp(),
+            current=completed_current,
+            total=completed_total,
+            lastLine=last_line or ("Rescan complete." if return_code == 0 else "Rescan failed."),
+            error=error_text,
+            command=rendered_command,
+            sourceCount=source_count,
+            entryCount=entry_count,
+            pid=None,
         )
 
     def handle_open_scad(self, entry: dict[str, Any]) -> None:

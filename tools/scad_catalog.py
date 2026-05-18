@@ -1450,6 +1450,7 @@ def html_template(payload: dict[str, Any]) -> str:
       display: flex;
       flex-wrap: wrap;
       gap: 0.75rem;
+      align-items: center;
       margin-bottom: 1rem;
     }}
     .tabs {{
@@ -1793,6 +1794,122 @@ def html_template(payload: dict[str, Any]) -> str:
       font-size: 0.88rem;
       line-height: 1.45;
     }}
+    .scan-indicator {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }}
+    .scan-dot {{
+      width: 0.7rem;
+      height: 0.7rem;
+      border-radius: 999px;
+      background: var(--accent-2);
+      box-shadow: 0 0 0 rgba(200, 93, 47, 0.4);
+      animation: pulse 1.4s ease-in-out infinite;
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ box-shadow: 0 0 0 0 rgba(200, 93, 47, 0.35); }}
+      50% {{ box-shadow: 0 0 0 0.5rem rgba(200, 93, 47, 0); }}
+    }}
+    .assistant-modal {{
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.9fr);
+      min-height: min(86vh, 860px);
+    }}
+    .assistant-pane {{
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      gap: 0.9rem;
+    }}
+    .assistant-results-pane {{
+      border-left: 1px solid rgba(212, 196, 174, 0.9);
+      background: rgba(255,255,255,0.55);
+    }}
+    .assistant-thread {{
+      display: grid;
+      gap: 0.75rem;
+      align-content: start;
+      min-height: 0;
+      overflow: auto;
+      padding-right: 0.2rem;
+    }}
+    .assistant-message {{
+      max-width: min(90%, 42rem);
+      border-radius: 1rem;
+      padding: 0.85rem 1rem;
+      line-height: 1.5;
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      background: rgba(255,255,255,0.86);
+    }}
+    .assistant-message.user {{
+      margin-left: auto;
+      background: rgba(13, 111, 99, 0.12);
+      border-color: rgba(13, 111, 99, 0.24);
+    }}
+    .assistant-message.assistant {{
+      margin-right: auto;
+    }}
+    .assistant-composer {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.75rem;
+      align-items: start;
+    }}
+    .assistant-composer textarea {{
+      width: 100%;
+      min-height: 6rem;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 0.95rem 1rem;
+      font: inherit;
+      background: rgba(255,255,255,0.92);
+      color: var(--text);
+    }}
+    .assistant-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }}
+    .assistant-results {{
+      display: grid;
+      gap: 0.85rem;
+      align-content: start;
+    }}
+    .assistant-result-card {{
+      border: 1px solid rgba(212, 196, 174, 0.9);
+      border-radius: 1rem;
+      padding: 0.9rem;
+      background: rgba(255,255,255,0.78);
+      display: grid;
+      gap: 0.55rem;
+    }}
+    .assistant-result-card h3 {{
+      margin: 0;
+      font-size: 1rem;
+      line-height: 1.15;
+    }}
+    .assistant-result-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+    }}
+    .assistant-suggestions {{
+      display: grid;
+      gap: 0.45rem;
+    }}
+    .assistant-suggestion {{
+      color: var(--muted);
+      font-size: 0.86rem;
+      line-height: 1.4;
+    }}
+    .assistant-empty {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+      padding: 0.2rem 0;
+    }}
     @media (max-width: 720px) {{
       .toolbar {{
         grid-template-columns: 1fr;
@@ -1806,6 +1923,13 @@ def html_template(payload: dict[str, Any]) -> str:
       .modal-pane.preview-pane {{
         border-right: none;
         border-bottom: 1px solid rgba(212, 196, 174, 0.9);
+      }}
+      .assistant-results-pane {{
+        border-left: none;
+        border-top: 1px solid rgba(212, 196, 174, 0.9);
+      }}
+      .assistant-composer {{
+        grid-template-columns: 1fr;
       }}
     }}
   </style>
@@ -1830,7 +1954,13 @@ def html_template(payload: dict[str, Any]) -> str:
       <div class="summary" id="summary"></div>
     </section>
     <div class="top-actions">
+      <button class="secondary" id="assistant-btn" type="button">Assistant</button>
+      <button class="ghost" id="clear-assistant-filter-btn" type="button" hidden>Clear Assistant Filter</button>
       <button class="secondary" id="settings-btn" type="button">Configure / Scan</button>
+      <div class="scan-indicator" id="scan-indicator" hidden>
+        <span class="scan-dot"></span>
+        <span id="scan-indicator-text">Scan running...</span>
+      </div>
     </div>
     <div class="tabs">
       <button class="secondary tab-active" id="tab-scad-btn" type="button">Customizable SCAD</button>
@@ -1882,9 +2012,33 @@ def html_template(payload: dict[str, Any]) -> str:
           <button class="ghost" id="add-source-btn" type="button">Add Source</button>
           <button class="ghost" id="close-settings-btn" type="button">Close</button>
         </div>
+        <p class="small-note" id="rescan-note">
+          Once started, rescans continue even if you close this window or reload the page.
+        </p>
       </section>
       <section class="modal-pane">
         <div class="settings-list" id="settings-list"></div>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="assistant-dialog">
+    <div class="modal assistant-modal">
+      <section class="modal-pane assistant-pane">
+        <div class="eyebrow">Assistant</div>
+        <h2 class="modal-title">Catalog Assistant</h2>
+        <div class="status-box" id="assistant-status"></div>
+        <div class="assistant-thread" id="assistant-thread"></div>
+        <div class="assistant-composer">
+          <textarea id="assistant-input" placeholder="Ask for parts, use cases, or starting customizations."></textarea>
+          <div class="assistant-actions">
+            <button class="primary" id="assistant-send-btn" type="button">Send</button>
+            <button class="ghost" id="assistant-close-btn" type="button">Close</button>
+          </div>
+        </div>
+      </section>
+      <section class="modal-pane assistant-results-pane">
+        <div class="eyebrow">Matches</div>
+        <div class="assistant-results" id="assistant-results"></div>
       </section>
     </div>
   </dialog>
@@ -1901,6 +2055,7 @@ def html_template(payload: dict[str, Any]) -> str:
     const footer = document.getElementById("footer");
     const customizer = document.getElementById("customizer");
     const settingsDialog = document.getElementById("settings-dialog");
+    const assistantDialog = document.getElementById("assistant-dialog");
     const modalCategory = document.getElementById("modal-category");
     const modalTitle = document.getElementById("modal-title");
     const modalPath = document.getElementById("modal-path");
@@ -1915,6 +2070,8 @@ def html_template(payload: dict[str, Any]) -> str:
     const copyCommandBtn = document.getElementById("copy-command-btn");
     const resetParamsBtn = document.getElementById("reset-params-btn");
     const closeModalBtn = document.getElementById("close-modal-btn");
+    const assistantBtn = document.getElementById("assistant-btn");
+    const clearAssistantFilterBtn = document.getElementById("clear-assistant-filter-btn");
     const settingsBtn = document.getElementById("settings-btn");
     const saveSettingsBtn = document.getElementById("save-settings-btn");
     const saveRescanBtn = document.getElementById("save-rescan-btn");
@@ -1924,8 +2081,16 @@ def html_template(payload: dict[str, Any]) -> str:
     const settingsList = document.getElementById("settings-list");
     const settingsStatus = document.getElementById("settings-status");
     const configPathNote = document.getElementById("config-path-note");
+    const scanIndicator = document.getElementById("scan-indicator");
+    const scanIndicatorText = document.getElementById("scan-indicator-text");
     const tabScadBtn = document.getElementById("tab-scad-btn");
     const tabBakedBtn = document.getElementById("tab-baked-btn");
+    const assistantStatus = document.getElementById("assistant-status");
+    const assistantThread = document.getElementById("assistant-thread");
+    const assistantResults = document.getElementById("assistant-results");
+    const assistantInput = document.getElementById("assistant-input");
+    const assistantSendBtn = document.getElementById("assistant-send-btn");
+    const assistantCloseBtn = document.getElementById("assistant-close-btn");
     const aiMetadata = payload.ai || null;
 
     let currentEntry = null;
@@ -1934,6 +2099,14 @@ def html_template(payload: dict[str, Any]) -> str:
     let editableConfig = null;
     let configPath = "";
     let activeTab = "scad";
+    let assistantMessages = [];
+    let assistantMatches = [];
+    let assistantFilterIds = null;
+    let assistantBusy = false;
+    let rescanStatus = null;
+    let rescanPollTimer = null;
+    let rescanReloadOnComplete = false;
+    const entryById = new Map(entries.map((entry) => [entry.id, entry]));
 
     const sourceNames = [...new Set(entries.map((entry) => entry.sourceName))].sort();
     for (const sourceName of sourceNames) {{
@@ -1973,6 +2146,9 @@ def html_template(payload: dict[str, Any]) -> str:
         `${{aiCount}} AI-tagged`,
         `${{errorCount}} with export issues`,
       ];
+      if (assistantFilterIds?.size) {{
+        chips.splice(1, 0, `${{assistantFilterIds.size}} assistant picks`);
+      }}
       for (const label of chips) {{
         const span = document.createElement("span");
         span.className = "chip";
@@ -2121,6 +2297,9 @@ def html_template(payload: dict[str, Any]) -> str:
         if (category && entry.category !== category) {{
           return false;
         }}
+        if (assistantFilterIds && !assistantFilterIds.has(entry.id)) {{
+          return false;
+        }}
         if (!needle) {{
           return true;
         }}
@@ -2134,6 +2313,7 @@ def html_template(payload: dict[str, Any]) -> str:
 
       empty.style.display = filtered.length ? "none" : "block";
       renderSummary(filtered);
+      clearAssistantFilterBtn.hidden = !assistantFilterIds?.size;
     }}
 
     function shellQuote(text) {{
@@ -2357,6 +2537,221 @@ def html_template(payload: dict[str, Any]) -> str:
       exportStlBtn.disabled = !serverAvailable;
       openScadBtn.disabled = !serverAvailable;
       settingsBtn.disabled = !serverAvailable;
+      assistantBtn.disabled = !serverAvailable;
+    }}
+
+    function updateAssistantStatus(message = "", tone = "") {{
+      assistantStatus.textContent = message;
+      assistantStatus.className = tone ? `status-box ${{tone}}` : "status-box";
+    }}
+
+    function ensureAssistantWelcome() {{
+      if (assistantMessages.length) {{
+        return;
+      }}
+      assistantMessages = [
+        {{
+          role: "assistant",
+          content:
+            "Ask what you want to build or mount, and I’ll suggest matching parts from this local catalog plus likely starting customizations.",
+        }},
+      ];
+    }}
+
+    function renderAssistantThread() {{
+      assistantThread.innerHTML = "";
+      for (const message of assistantMessages) {{
+        const bubble = document.createElement("div");
+        bubble.className = `assistant-message ${{message.role}}`;
+        bubble.textContent = message.content;
+        assistantThread.appendChild(bubble);
+      }}
+      assistantThread.scrollTop = assistantThread.scrollHeight;
+    }}
+
+    function entryForAssistantMatch(match) {{
+      if (!match || typeof match.id !== "string") {{
+        return null;
+      }}
+      return entryById.get(match.id) || null;
+    }}
+
+    function showAssistantEntry(match, openAfter = false) {{
+      const entry = entryForAssistantMatch(match);
+      if (!entry) {{
+        return;
+      }}
+      assistantFilterIds = new Set([entry.id]);
+      sourceSelect.value = entry.sourceName || "";
+      categorySelect.value = entry.category || "";
+      searchInput.value = "";
+      setActiveTab(entry.entryType === "baked" ? "baked" : "scad");
+      assistantDialog.close();
+      grid.scrollIntoView({{ behavior: "smooth", block: "start" }});
+      if (openAfter && entry.entryType === "scad") {{
+        window.setTimeout(() => openCustomizer(entry), 150);
+      }}
+    }}
+
+    function applyAssistantFilter(matches) {{
+      const ids = matches
+        .map((match) => match.id)
+        .filter((value) => typeof value === "string" && entryById.has(value));
+      assistantMatches = matches;
+      assistantFilterIds = ids.length ? new Set(ids) : null;
+      if (!assistantFilterIds) {{
+        applyFilters();
+        return;
+      }}
+      const scadMatches = ids.filter((id) => entryById.get(id)?.entryType === "scad").length;
+      const bakedMatches = ids.length - scadMatches;
+      sourceSelect.value = "";
+      categorySelect.value = "";
+      searchInput.value = "";
+      setActiveTab(scadMatches >= bakedMatches ? "scad" : "baked");
+    }}
+
+    function renderAssistantResults() {{
+      assistantResults.innerHTML = "";
+      if (!assistantMatches.length) {{
+        const emptyState = document.createElement("div");
+        emptyState.className = "assistant-empty";
+        emptyState.textContent =
+          "Best matches and starting customization ideas will appear here after you ask the assistant something.";
+        assistantResults.appendChild(emptyState);
+        return;
+      }}
+      for (const match of assistantMatches) {{
+        const entry = entryForAssistantMatch(match);
+        if (!entry) {{
+          continue;
+        }}
+        const card = document.createElement("section");
+        card.className = "assistant-result-card";
+
+        const eyebrow = document.createElement("div");
+        eyebrow.className = "eyebrow";
+        eyebrow.textContent = `${{entry.sourceName}} / ${{entry.category}}`;
+        card.appendChild(eyebrow);
+
+        const title = document.createElement("h3");
+        title.textContent = entry.title;
+        card.appendChild(title);
+
+        const chips = document.createElement("div");
+        chips.className = "tag-list";
+        chips.appendChild(makeTag(entry.entryType === "scad" ? "customizable" : fileFormatLabel(entry)));
+        if (entry.entryType === "scad") {{
+          chips.appendChild(makeTag(`${{entry.parameterCount}} parameters`));
+        }}
+        card.appendChild(chips);
+
+        if (match.reason) {{
+          const reason = document.createElement("div");
+          reason.className = "small-note";
+          reason.textContent = match.reason;
+          card.appendChild(reason);
+        }}
+
+        if (match.suggestedParameters?.length) {{
+          const suggestions = document.createElement("div");
+          suggestions.className = "assistant-suggestions";
+          for (const suggestion of match.suggestedParameters) {{
+            const row = document.createElement("div");
+            row.className = "assistant-suggestion";
+            const parameter = entry.parameters.find((item) => item.name === suggestion.name);
+            const label =
+              currentEntry?.id === entry.id
+                ? parameterHintFor(parameter || {{ name: suggestion.name }})?.label || suggestion.name
+                : entry.ai?.parameterHints?.[suggestion.name]?.label || suggestion.name;
+            const valueText = suggestion.suggestedValue ? `: ${{suggestion.suggestedValue}}` : "";
+            row.textContent = `${{label}}${{valueText}}${{suggestion.reason ? ` - ${{suggestion.reason}}` : ""}}`;
+            suggestions.appendChild(row);
+          }}
+          card.appendChild(suggestions);
+        }}
+
+        const actions = document.createElement("div");
+        actions.className = "assistant-result-actions";
+
+        const showBtn = document.createElement("button");
+        showBtn.className = "secondary";
+        showBtn.type = "button";
+        showBtn.textContent = "Show In Catalog";
+        showBtn.addEventListener("click", () => showAssistantEntry(match, false));
+        actions.appendChild(showBtn);
+
+        if (entry.entryType === "scad") {{
+          const openBtn = document.createElement("button");
+          openBtn.className = "ghost";
+          openBtn.type = "button";
+          openBtn.textContent = "Open Customizer";
+          openBtn.addEventListener("click", () => showAssistantEntry(match, true));
+          actions.appendChild(openBtn);
+        }}
+
+        card.appendChild(actions);
+        assistantResults.appendChild(card);
+      }}
+    }}
+
+    async function sendAssistantMessage() {{
+      const text = assistantInput.value.trim();
+      if (!text || !serverAvailable || assistantBusy) {{
+        return;
+      }}
+      ensureAssistantWelcome();
+      assistantBusy = true;
+      assistantMessages.push({{ role: "user", content: text }});
+      assistantInput.value = "";
+      renderAssistantThread();
+      updateAssistantStatus("Assistant is reviewing the local catalog...", "");
+      assistantSendBtn.disabled = true;
+      try {{
+        const data = await postJson(`${{payload.serverBasePath}}/assistant`, {{
+          currentTab: activeTab,
+          messages: assistantMessages,
+        }});
+        assistantMessages.push({{
+          role: "assistant",
+          content: data.reply || "I found some grounded matches in the local catalog.",
+        }});
+        if (data.followUp) {{
+          assistantMessages.push({{
+            role: "assistant",
+            content: `Next step: ${{data.followUp}}`,
+          }});
+        }}
+        assistantMatches = Array.isArray(data.matches) ? data.matches : [];
+        applyAssistantFilter(assistantMatches);
+        renderAssistantResults();
+        renderAssistantThread();
+        updateAssistantStatus(
+          data.assistantUsed
+            ? "Assistant suggestions are grounded in the local catalog and Ollama."
+            : "Assistant fell back to local catalog matching without Ollama ranking.",
+          data.assistantUsed ? "success" : ""
+        );
+      }} catch (error) {{
+        updateAssistantStatus(error.message, "error");
+      }} finally {{
+        assistantBusy = false;
+        assistantSendBtn.disabled = false;
+      }}
+    }}
+
+    function openAssistant() {{
+      ensureAssistantWelcome();
+      renderAssistantThread();
+      renderAssistantResults();
+      updateAssistantStatus(
+        serverAvailable
+          ? "Ask about use cases, matching parts, or likely starting parameters."
+          : "Open this catalog through the local server to use Assistant.",
+        ""
+      );
+      assistantDialog.showModal();
+      assistantInput.focus();
     }}
 
     function setActiveTab(tab) {{
@@ -2394,6 +2789,126 @@ def html_template(payload: dict[str, Any]) -> str:
       return data;
     }}
 
+    function rescanActivityLabel(status) {{
+      return status?.forced ? "Force rebuild" : "Rescan";
+    }}
+
+    function rescanProgressText(status) {{
+      if (!status?.active) {{
+        return "";
+      }}
+      const label = rescanActivityLabel(status);
+      if ((status.total || 0) > 0) {{
+        return `${{label}} running: ${{status.current || 0}} / ${{status.total}} (${{status.progressPercent || 0}}%)`;
+      }}
+      return `${{label}} running...`;
+    }}
+
+    function rescanDetailText(status) {{
+      const detail = String(status?.lastLine || "").trim();
+      if (!detail) {{
+        return "";
+      }}
+      const lowerDetail = detail.toLowerCase();
+      const lowerLabel = rescanActivityLabel(status).toLowerCase();
+      if (lowerDetail.includes(lowerLabel) && lowerDetail.includes("running")) {{
+        return "";
+      }}
+      return detail;
+    }}
+
+    function rescanCompletionText(status) {{
+      const label = rescanActivityLabel(status);
+      const entryCount = Number(status?.entryCount || 0);
+      const sourceCount = Number(status?.sourceCount || 0);
+      return `${{label}} complete: ${{entryCount}} entries across ${{sourceCount}} sources.`;
+    }}
+
+    function rescanFailureText(status) {{
+      const label = rescanActivityLabel(status);
+      const detail = String(status?.error || status?.lastLine || "Rescan failed.").trim();
+      return `${{label}} failed: ${{detail}}`;
+    }}
+
+    function renderScanIndicator(status = rescanStatus) {{
+      const active = Boolean(status?.active);
+      scanIndicator.hidden = !active;
+      scanIndicatorText.textContent = active ? rescanProgressText(status) : "Scan running...";
+      saveRescanBtn.disabled = active;
+      saveForceRescanBtn.disabled = active;
+    }}
+
+    function updateSettingsForRescan(status, phase = "active") {{
+      if (!status) {{
+        return;
+      }}
+      if (phase === "error") {{
+        updateSettingsStatus(rescanFailureText(status), "error");
+        return;
+      }}
+      if (phase === "complete") {{
+        updateSettingsStatus(rescanCompletionText(status), "success");
+        return;
+      }}
+      const progress = rescanProgressText(status);
+      const detail = rescanDetailText(status);
+      updateSettingsStatus(detail ? `${{progress}} ${detail}` : progress, "");
+    }}
+
+    async function fetchRescanStatus() {{
+      const response = await fetch(`${{payload.serverBasePath}}/rescan-status`);
+      const data = await response.json();
+      if (!response.ok || !data.ok) {{
+        throw new Error(data.error || "Failed to read rescan status");
+      }}
+      const previousActive = Boolean(rescanStatus?.active);
+      rescanStatus = data.status || null;
+      renderScanIndicator(rescanStatus);
+      if (rescanStatus?.active) {{
+        updateSettingsForRescan(rescanStatus, "active");
+      }} else if (previousActive) {{
+        if (rescanStatus?.error) {{
+          updateSettingsForRescan(rescanStatus, "error");
+          rescanReloadOnComplete = false;
+        }} else {{
+          updateSettingsForRescan(rescanStatus, "complete");
+          if (rescanReloadOnComplete) {{
+            rescanReloadOnComplete = false;
+            window.setTimeout(() => window.location.reload(), 700);
+          }}
+        }}
+      }}
+      return rescanStatus;
+    }}
+
+    function stopRescanPolling() {{
+      if (rescanPollTimer) {{
+        window.clearTimeout(rescanPollTimer);
+        rescanPollTimer = null;
+      }}
+    }}
+
+    async function pollRescanStatus() {{
+      try {{
+        await fetchRescanStatus();
+      }} catch (_error) {{
+        stopRescanPolling();
+        return;
+      }}
+      if (rescanStatus?.active) {{
+        rescanPollTimer = window.setTimeout(pollRescanStatus, 1200);
+      }} else {{
+        rescanPollTimer = null;
+      }}
+    }}
+
+    function startRescanPolling() {{
+      if (rescanPollTimer) {{
+        return;
+      }}
+      rescanPollTimer = window.setTimeout(pollRescanStatus, 0);
+    }}
+
     async function detectServer() {{
       try {{
         const response = await fetch(`${{payload.serverBasePath}}/health`);
@@ -2402,8 +2917,22 @@ def html_template(payload: dict[str, Any]) -> str:
         }}
         const data = await response.json();
         serverAvailable = Boolean(data.ok);
+        if (serverAvailable) {{
+          try {{
+            await fetchRescanStatus();
+          }} catch (_error) {{
+            rescanStatus = null;
+            renderScanIndicator(null);
+          }}
+          if (data.rescanActive || rescanStatus?.active) {{
+            startRescanPolling();
+          }}
+        }}
       }} catch (_error) {{
         serverAvailable = false;
+        rescanStatus = null;
+        stopRescanPolling();
+        renderScanIndicator(null);
       }}
       updateServerStatus();
     }}
@@ -2495,6 +3024,12 @@ def html_template(payload: dict[str, Any]) -> str:
     function updateSettingsStatus(message = "", tone = "") {{
       settingsStatus.textContent = message;
       settingsStatus.className = tone ? `status-box ${{tone}}` : "status-box";
+    }}
+
+    function clearAssistantFilter() {{
+      assistantFilterIds = null;
+      applyFilters();
+      updateAssistantStatus("Assistant filter cleared.", "");
     }}
 
     function blankSource() {{
@@ -2828,7 +3363,14 @@ def html_template(payload: dict[str, Any]) -> str:
       updateSettingsStatus("Loading source configuration...", "");
       try {{
         await loadConfig();
-        updateSettingsStatus("", "");
+        if (rescanStatus?.active) {{
+          updateSettingsForRescan(rescanStatus, "active");
+          startRescanPolling();
+        }} else if (rescanStatus?.error) {{
+          updateSettingsForRescan(rescanStatus, "error");
+        }} else {{
+          updateSettingsStatus("", "");
+        }}
         settingsDialog.showModal();
       }} catch (error) {{
         updateSettingsStatus(error.message, "error");
@@ -2849,13 +3391,20 @@ def html_template(payload: dict[str, Any]) -> str:
     }}
 
     async function triggerRescan(force = false) {{
-      updateSettingsStatus(force ? "Force rebuilding libraries..." : "Rescanning libraries...", "");
-      const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{ force }});
       updateSettingsStatus(
-        `${{data.forced ? "Force rebuild" : "Rescan"}} complete: ${{data.entryCount}} entries across ${{data.sourceCount}} sources. Reloading...`,
-        "success"
+        force ? "Starting background force rebuild..." : "Starting background rescan...",
+        ""
       );
-      window.setTimeout(() => window.location.reload(), 600);
+      const data = await postJson(`${{payload.serverBasePath}}/rescan`, {{ force }});
+      rescanReloadOnComplete = true;
+      rescanStatus = data.status || rescanStatus;
+      renderScanIndicator(rescanStatus);
+      if (data.alreadyRunning) {{
+        updateSettingsStatus("A rescan is already running. Tracking progress below.", "");
+      }} else if (rescanStatus?.active) {{
+        updateSettingsForRescan(rescanStatus, "active");
+      }}
+      startRescanPolling();
       return data;
     }}
 
@@ -2868,7 +3417,17 @@ def html_template(payload: dict[str, Any]) -> str:
     exportStlBtn.addEventListener("click", exportBinaryStl);
     openScadBtn.addEventListener("click", openInOpenScad);
     copyCommandBtn.addEventListener("click", copyCommand);
+    assistantBtn.addEventListener("click", openAssistant);
+    assistantSendBtn.addEventListener("click", sendAssistantMessage);
+    assistantCloseBtn.addEventListener("click", () => assistantDialog.close());
+    clearAssistantFilterBtn.addEventListener("click", clearAssistantFilter);
     settingsBtn.addEventListener("click", openSettings);
+    assistantInput.addEventListener("keydown", (event) => {{
+      if (event.key === "Enter" && !event.shiftKey) {{
+        event.preventDefault();
+        sendAssistantMessage();
+      }}
+    }});
     addSourceBtn.addEventListener("click", () => {{
       if (!editableConfig) {{
         editableConfig = {{ tools: blankToolsConfig(), ai: blankAiConfig(), sources: [] }};
@@ -2933,6 +3492,17 @@ def html_template(payload: dict[str, Any]) -> str:
         settingsDialog.close();
       }}
     }});
+    assistantDialog.addEventListener("click", (event) => {{
+      const rect = assistantDialog.getBoundingClientRect();
+      const withinDialog =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (!withinDialog) {{
+        assistantDialog.close();
+      }}
+    }});
 
     footer.textContent =
       `Generated ${{payload.generatedAt}} using ${{payload.openscadBin}} across ${{payload.sources.length}} configured source libraries.` +
@@ -2944,6 +3514,8 @@ def html_template(payload: dict[str, Any]) -> str:
       ` Run the local server for custom preview renders and binary STL exports.`;
 
     refreshConfiguredLabels();
+    ensureAssistantWelcome();
+    renderAssistantResults();
     setActiveTab("scad");
     detectServer();
   </script>
