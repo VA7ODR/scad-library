@@ -4,12 +4,12 @@ This tool is driven by `sources.json`.
 
 An optional top-level `tools` block can configure the OpenSCAD executable and slicer executable used by the local server and by config-driven rescans.
 
-Each configured source is one library folder, and each source has a `type`:
+Each configured source is one library folder. Every source is scanned for:
 
-- `scad`
-  - customizable OpenSCAD source files
-- `stl`
-  - baked STL folders
+- customizable OpenSCAD `.scad` files
+- baked object files such as `.stl` and `.3mf`
+
+Legacy source `type` fields are still accepted in existing configs, but scan classification now happens per file.
 
 An optional top-level `ai` block can enable local Ollama enrichment during indexing. When enabled and available, the indexer can add:
 
@@ -24,7 +24,7 @@ If Ollama is disabled, offline, or missing the configured model, the catalog sti
 Preview generation is intentionally consistent across source types:
 
 - SCAD previews are rendered directly with `openscad-nightly`
-- STL previews are rendered with `openscad-nightly` through generated wrapper `.scad` files
+- baked object previews are rendered with `openscad-nightly` through generated wrapper `.scad` files
 
 Generated wrapper files live in:
 
@@ -42,7 +42,7 @@ SCAD entries support:
 - export binary STL or export straight to a configured slicer
 - copy command
 
-STL entries support:
+Baked object entries support:
 
 - open/download source
 - open in slicer

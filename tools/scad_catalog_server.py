@@ -26,6 +26,9 @@ DEFAULT_CATALOG_DIR = ".catalog"
 DEFAULT_OPENSCAD_BIN = "openscad-nightly"
 DEFAULT_SLICER_BIN = ""
 DEFAULT_CONFIG_PATH = "sources.json"
+SCAD_FILE_EXTENSION = ".scad"
+BAKED_FILE_EXTENSIONS = {".stl", ".3mf"}
+SUPPORTED_SOURCE_TYPES = {"scad", "stl", "mixed", "auto"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -338,8 +341,8 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         for index, source in enumerate(sources, start=1):
             if not isinstance(source, dict):
                 raise ValueError(f"Source #{index} must be an object.")
-            source_type = source.get("type", "scad")
-            if source_type not in {"scad", "stl"}:
+            source_type = source.get("type", "mixed")
+            if source_type not in SUPPORTED_SOURCE_TYPES:
                 raise ValueError(f"Source #{index} has unsupported type '{source_type}'.")
             if not isinstance(source.get("name"), str) or not source["name"].strip():
                 raise ValueError(f"Source #{index} must have a non-empty 'name'.")
@@ -386,9 +389,10 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             raise ValueError(f"Entry '{entry_id}' is missing absoluteSourcePath")
 
         source_path = Path(source_path_text).expanduser().resolve()
-        if not source_path.exists() or source_path.suffix.lower() not in {".scad", ".stl"}:
+        valid_suffixes = {SCAD_FILE_EXTENSION, *BAKED_FILE_EXTENSIONS}
+        if not source_path.exists() or source_path.suffix.lower() not in valid_suffixes:
             raise ValueError(
-                f"Entry '{entry_id}' does not resolve to a valid .scad or .stl file"
+                f"Entry '{entry_id}' does not resolve to a valid .scad, .stl, or .3mf file"
             )
 
         entry["_resolved_source_path"] = source_path
@@ -674,6 +678,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         entry: dict[str, Any],
         parameters: dict[str, Any],
     ) -> None:
+        if entry.get("entryType") != "scad":
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "Only SCAD entries support parameterized preview rendering."},
+            )
+            return
         source_path = entry["absoluteSourcePath"]
         resolved_source = entry["_resolved_source_path"]
         library_paths = entry.get("libraryPaths", [])
@@ -731,6 +741,12 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         entry: dict[str, Any],
         parameters: dict[str, Any],
     ) -> None:
+        if entry.get("entryType") != "scad":
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "Only SCAD entries support STL export."},
+            )
+            return
         source_path = entry["absoluteSourcePath"]
         resolved_source = entry["_resolved_source_path"]
         library_paths = entry.get("libraryPaths", [])

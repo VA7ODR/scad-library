@@ -1,6 +1,6 @@
 # SCAD Catalog
 
-`scad-catalog` is a local browser UI for OpenSCAD and STL libraries.
+`scad-catalog` is a local browser UI for OpenSCAD libraries and baked object folders.
 
 It can:
 
@@ -9,7 +9,7 @@ It can:
 - expose OpenSCAD Customizer parameters
 - export binary STL files
 - open source `.scad` files in OpenSCAD
-- open baked `.stl` files directly in a slicer
+- open baked `.stl` and `.3mf` files directly in a slicer
 - manage source folders from the browser
 - optionally enrich entries with local Ollama-generated summaries, tags, and friendlier parameter labels
 
@@ -75,7 +75,6 @@ Example:
     {
       "id": "my-scad-library",
       "name": "My SCAD Library",
-      "type": "scad",
       "path": "/path/to/scad/library",
       "libraryPaths": ["/path/to/openscad/libs"],
       "includeHelpers": false,
@@ -83,10 +82,9 @@ Example:
       "includeDeprecated": false
     },
     {
-      "id": "my-stl-library",
-      "name": "My STL Library",
-      "type": "stl",
-      "path": "/path/to/stl/folder",
+      "id": "my-baked-library",
+      "name": "My Baked Library",
+      "path": "/path/to/baked/folder",
       "libraryPaths": []
     }
   ]
@@ -97,12 +95,14 @@ Source fields:
 
 - `id`: stable internal identifier
 - `name`: display label in the UI
-- `type`: `scad` or `stl`
 - `path`: folder to scan
 - `libraryPaths`: paths added to `OPENSCADPATH` for that source
-- `includeHelpers`: SCAD only
-- `includeInProgress`: SCAD only
-- `includeDeprecated`: SCAD only
+- `includeHelpers`: SCAD files only
+- `includeInProgress`: SCAD files only
+- `includeDeprecated`: SCAD files only
+
+Each configured source folder is scanned for both customizable `.scad` files and baked object files such as `.stl` and `.3mf`.
+Legacy `type` values are still accepted in old configs, but scanning is now file-driven.
 
 Tool fields:
 
@@ -117,7 +117,7 @@ AI fields:
 - `model`: local model name such as `qwen3:4b-instruct`
 - `timeout`: request timeout in seconds
 - `includeScad`: allow AI summaries/tags/parameter labels for SCAD entries
-- `includeStl`: allow AI summaries/tags for STL entries
+- `includeStl`: allow AI summaries/tags for baked object entries such as STL and 3MF
 - `maxSourceChars`: max source excerpt sent to Ollama per SCAD file
 - `maxCommentChars`: max leading comment text sent to Ollama per SCAD file
 
@@ -137,7 +137,7 @@ This writes:
 - `.catalog/index.html`
 - `.catalog/previews/`
 - `.catalog/metadata/`
-- `.catalog/wrappers/` for STL preview wrappers
+- `.catalog/wrappers/` for baked object preview wrappers
 
 Useful variants:
 
@@ -169,18 +169,18 @@ http://127.0.0.1:8765/.catalog/index.html
 The app currently supports:
 
 - a `Customizable SCAD` tab
-- a `Baked STL` tab
+- a `Baked Object` tab
 - source filtering
 - rescan from the browser
 - force a full rebuild from the browser
 - folder/source editing from the browser
 - OpenSCAD launch for `.scad` entries
-- slicer launch for `.stl` entries
+- slicer launch for baked `.stl` and `.3mf` entries
 
 ## Notes
 
 - SCAD previews are rendered by `openscad-nightly`
-- STL previews are also rendered by `openscad-nightly` through generated wrapper `.scad` files
+- baked object previews are also rendered by `openscad-nightly` through generated wrapper `.scad` files
 - AI enrichment is optional and cached under `.catalog/ai/`
 - AI enrichment never edits or rewrites your SCAD files
 - the server defaults to `openscad-nightly`

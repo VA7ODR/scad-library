@@ -1,5 +1,6 @@
 .catalog/
 .catalog-test/
+.local/
 
 tools/__pycache__/
 *.pyc

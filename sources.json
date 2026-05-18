@@ -18,7 +18,6 @@
     {
       "id": "my-scad-library",
       "name": "My SCAD Library",
-      "type": "scad",
       "path": "/path/to/scad/library",
       "libraryPaths": [
         "/path/to/openscad/libs"
@@ -28,10 +27,9 @@
       "includeDeprecated": false
     },
     {
-      "id": "my-stl-library",
-      "name": "My STL Library",
-      "type": "stl",
-      "path": "/path/to/stl/folder",
+      "id": "my-baked-library",
+      "name": "My Baked Library",
+      "path": "/path/to/baked/folder",
       "libraryPaths": []
     }
   ]

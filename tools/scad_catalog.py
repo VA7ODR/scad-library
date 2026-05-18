@@ -30,6 +30,9 @@ DEFAULT_AI_TIMEOUT = 30
 DEFAULT_AI_MAX_SOURCE_CHARS = 12000
 DEFAULT_AI_MAX_COMMENT_CHARS = 3000
 AI_PROMPT_VERSION = 1
+SCAD_FILE_EXTENSION = ".scad"
+BAKED_FILE_EXTENSIONS = {".stl", ".3mf"}
+SUPPORTED_SOURCE_TYPES = {"scad", "stl", "mixed", "auto"}
 
 
 @dataclass
@@ -78,6 +81,7 @@ class ToolConfig:
 class Entry:
     id: str
     entry_type: str
+    file_format: str
     source_id: str
     source_name: str
     source_path: Path
@@ -117,6 +121,7 @@ class Entry:
             self.title,
             self.relative_path,
             self.category,
+            self.file_format,
             *self.tags,
             *self.group_names,
             *self.parameter_names,
@@ -145,6 +150,7 @@ class Entry:
         return {
             "id": self.id,
             "entryType": self.entry_type,
+            "fileFormat": self.file_format,
             "sourceId": self.source_id,
             "sourceName": self.source_name,
             "title": self.title,
@@ -430,10 +436,11 @@ def load_sources(
         if not source_root.is_dir():
             raise SystemExit(f"Source '{name}' is not a directory: {source_root}")
 
-        source_type = raw.get("type", "scad")
-        if source_type not in {"scad", "stl"}:
+        source_type = raw.get("type", "mixed")
+        if source_type not in SUPPORTED_SOURCE_TYPES:
             raise SystemExit(
-                f"Source '{name}' has unsupported type '{source_type}'. Use 'scad' or 'stl'."
+                f"Source '{name}' has unsupported type '{source_type}'. "
+                "Use one of: scad, stl, mixed, auto."
             )
 
         source_id = raw.get("id")
@@ -461,7 +468,7 @@ def load_sources(
             SourceConfig(
                 id=source_id,
                 name=name,
-                source_type=source_type,
+                source_type="mixed",
                 source_root=source_root,
                 relative_root=relative_root,
                 library_paths=library_paths,
@@ -507,10 +514,24 @@ def should_include(
     return True
 
 
+def path_entry_type(path: Path) -> str:
+    return "scad" if path.suffix.lower() == SCAD_FILE_EXTENSION else "baked"
+
+
+def path_file_format(path: Path) -> str:
+    return path.suffix.lower().removeprefix(".")
+
+
+def is_scad_path(path: Path) -> bool:
+    return path.suffix.lower() == SCAD_FILE_EXTENSION
+
+
+def is_baked_path(path: Path) -> bool:
+    return path.suffix.lower() in BAKED_FILE_EXTENSIONS
+
+
 def discover_files(source: SourceConfig, args: argparse.Namespace) -> list[Path]:
-    if source.source_type == "stl":
-        return sorted(source.source_root.rglob("*.stl"))
-    return [
+    scad_files = [
         path
         for path in sorted(source.source_root.rglob("*.scad"))
         if should_include(
@@ -520,6 +541,10 @@ def discover_files(source: SourceConfig, args: argparse.Namespace) -> list[Path]
             include_deprecated=source.include_deprecated,
         )
     ]
+    baked_files: list[Path] = []
+    for extension in sorted(BAKED_FILE_EXTENSIONS):
+        baked_files.extend(sorted(source.source_root.rglob(f"*{extension}")))
+    return sorted(scad_files + baked_files)
 
 
 def collapse_whitespace(text: str) -> str:
@@ -654,14 +679,15 @@ def build_ai_context(
     ai_config: AIConfig,
 ) -> dict[str, Any]:
     context: dict[str, Any] = {
-        "sourceType": source.source_type,
+        "sourceType": path_entry_type(source_path),
+        "fileFormat": path_file_format(source_path),
         "sourceName": source.name,
         "relativePath": str(source_path.relative_to(source.source_root)),
         "title": title,
         "category": category,
         "tags": tags,
     }
-    if source.source_type == "scad":
+    if is_scad_path(source_path):
         source_excerpt = read_text_excerpt(source_path, ai_config.max_source_chars)
         context["leadingComment"] = extract_leading_comment(
             source_excerpt,
@@ -746,9 +772,9 @@ def enrich_with_ai(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not ai_state.available:
         return None, None
-    if source.source_type == "scad" and not ai_config.include_scad:
+    if is_scad_path(source_path) and not ai_config.include_scad:
         return None, None
-    if source.source_type == "stl" and not ai_config.include_stl:
+    if is_baked_path(source_path) and not ai_config.include_stl:
         return None, None
 
     context = build_ai_context(
@@ -1001,13 +1027,104 @@ def openscad_string_literal(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def ensure_stl_wrapper(wrapper_path: Path, stl_path: Path) -> None:
+def ensure_baked_wrapper(wrapper_path: Path, baked_path: Path) -> None:
     wrapper_path.parent.mkdir(parents=True, exist_ok=True)
     wrapper_path.write_text(
-        '// Auto-generated for STL preview rendering.\n'
-        f'import("{openscad_string_literal(stl_path.resolve())}");\n',
+        "// Auto-generated for baked object preview rendering.\n"
+        f'import("{openscad_string_literal(baked_path.resolve())}");\n',
         encoding="utf-8",
     )
+
+
+def decode_scad_string_literal(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return value
+
+
+def collect_string_parameter_comments(source_text: str) -> dict[str, list[str]]:
+    option_map: dict[str, list[str]] = {}
+    assignment_pattern = re.compile(
+        r'^\s*([A-Za-z_]\w*)\s*=\s*"((?:\\.|[^"\\])*)"\s*;?\s*(?://\s*(\[[^\n]*\]))?\s*$'
+    )
+    for line in source_text.splitlines():
+        match = assignment_pattern.match(line)
+        if not match:
+            continue
+        name, initial_text, comment_json = match.groups()
+        if not comment_json:
+            continue
+        options: list[str] = []
+        try:
+            parsed = json.loads(comment_json)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+            options.extend(item for item in parsed if item)
+        initial_value = decode_scad_string_literal(initial_text)
+        if initial_value and initial_value not in options:
+            options.insert(0, initial_value)
+        if options:
+            option_map[name] = options
+    return option_map
+
+
+def collect_string_parameter_comparisons(source_text: str, parameter_name: str) -> list[str]:
+    patterns = [
+        re.compile(
+            rf'\b{re.escape(parameter_name)}\b\s*(?:==|!=)\s*"((?:\\.|[^"\\])*)"'
+        ),
+        re.compile(
+            rf'"((?:\\.|[^"\\])*)"\s*(?:==|!=)\s*\b{re.escape(parameter_name)}\b'
+        ),
+    ]
+    values: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(source_text):
+            value = decode_scad_string_literal(match.group(1))
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def normalize_string_parameter_options(
+    source_path: Path,
+    parameters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not parameters:
+        return parameters
+    try:
+        source_text = source_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return parameters
+
+    explicit_comment_options = collect_string_parameter_comments(source_text)
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        if parameter.get("type") != "string":
+            continue
+        if parameter.get("options"):
+            continue
+        name = parameter.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        option_values = explicit_comment_options.get(name, [])
+        if not option_values:
+            option_values = collect_string_parameter_comparisons(source_text, name)
+            initial_value = parameter.get("initial")
+            if isinstance(initial_value, str) and initial_value and initial_value not in option_values:
+                option_values.insert(0, initial_value)
+            if len(option_values) < 2:
+                continue
+
+        parameter["options"] = [
+            {"name": option_value, "value": option_value}
+            for option_value in option_values
+        ]
+    return parameters
 
 
 def build_entry(
@@ -1022,8 +1139,8 @@ def build_entry(
     ai_config: AIConfig,
     ai_state: AIState,
 ) -> Entry:
-    if source.source_type == "stl":
-        return build_stl_entry(
+    if is_baked_path(source_path):
+        return build_baked_entry(
             source_path=source_path,
             source=source,
             output_dir=output_dir,
@@ -1081,6 +1198,8 @@ def build_scad_entry(
 
     title = metadata.get("title") if metadata else source_path.stem
     parameters = metadata.get("parameters", []) if metadata else []
+    if isinstance(parameters, list):
+        parameters = normalize_string_parameter_options(source_path, parameters)
     group_names = sorted(
         {param.get("group", "Ungrouped") for param in parameters if isinstance(param, dict)}
     )
@@ -1136,6 +1255,7 @@ def build_scad_entry(
     return Entry(
         id=entry_id,
         entry_type="scad",
+        file_format=path_file_format(source_path),
         source_id=source.id,
         source_name=source.name,
         source_path=source_path,
@@ -1161,7 +1281,7 @@ def build_scad_entry(
     )
 
 
-def build_stl_entry(
+def build_baked_entry(
     source_path: Path,
     source: SourceConfig,
     output_dir: Path,
@@ -1177,10 +1297,11 @@ def build_stl_entry(
     entry_id = slugify(f"{source.id}:{rel_from_source_root.with_suffix('')}")
     preview_file = preview_dir / f"{entry_id}.png"
     wrapper_file = output_dir / "wrappers" / f"{entry_id}.scad"
+    file_format = path_file_format(source_path)
 
     preview_error = None
     if not args.skip_previews:
-        ensure_stl_wrapper(wrapper_file, source_path)
+        ensure_baked_wrapper(wrapper_file, source_path)
         preview_error = render_preview(
             source_path=wrapper_file,
             output_path=preview_file,
@@ -1212,7 +1333,8 @@ def build_stl_entry(
 
     return Entry(
         id=entry_id,
-        entry_type="stl",
+        entry_type="baked",
+        file_format=file_format,
         source_id=source.id,
         source_name=source.name,
         source_path=source_path,
@@ -1221,7 +1343,7 @@ def build_stl_entry(
         title=source_path.stem,
         parameters=[],
         library_paths=[str(path) for path in source.library_paths],
-        tags=[],
+        tags=[file_format],
         parameter_count=0,
         group_names=[],
         parameter_names=[],
@@ -1712,7 +1834,7 @@ def html_template(payload: dict[str, Any]) -> str:
     </div>
     <div class="tabs">
       <button class="secondary tab-active" id="tab-scad-btn" type="button">Customizable SCAD</button>
-      <button class="secondary" id="tab-stl-btn" type="button">Baked STL</button>
+      <button class="secondary" id="tab-baked-btn" type="button">Baked Object</button>
     </div>
     <section class="grid" id="grid"></section>
     <section class="empty" id="empty">
@@ -1803,7 +1925,7 @@ def html_template(payload: dict[str, Any]) -> str:
     const settingsStatus = document.getElementById("settings-status");
     const configPathNote = document.getElementById("config-path-note");
     const tabScadBtn = document.getElementById("tab-scad-btn");
-    const tabStlBtn = document.getElementById("tab-stl-btn");
+    const tabBakedBtn = document.getElementById("tab-baked-btn");
     const aiMetadata = payload.ai || null;
 
     let currentEntry = null;
@@ -1834,15 +1956,19 @@ def html_template(payload: dict[str, Any]) -> str:
       const errorCount = filtered.filter((entry) => entry.metadataError || entry.previewError).length;
       const aiCount = filtered.filter((entry) => entry.ai && (entry.ai.summary || entry.ai.searchTerms?.length)).length;
       const scadCount = entries.filter((entry) => entry.entryType === "scad").length;
-      const stlCount = entries.filter((entry) => entry.entryType === "stl").length;
+      const bakedCount = entries.filter((entry) => entry.entryType === "baked").length;
+      const stlCount = entries.filter((entry) => entry.fileFormat === "stl").length;
+      const threeMfCount = entries.filter((entry) => entry.fileFormat === "3mf").length;
       summary.innerHTML = "";
       const chips = [
-        activeTab === "scad" ? "Customizable SCAD" : "Baked STL",
+        activeTab === "scad" ? "Customizable SCAD" : "Baked Object",
         `${{filtered.length}} shown`,
         `${{entries.length}} indexed`,
         `${{sourceNames.length}} sources`,
         `${{scadCount}} scad`,
+        `${{bakedCount}} baked`,
         `${{stlCount}} stl`,
+        `${{threeMfCount}} 3mf`,
         `${{previewCount}} with previews`,
         `${{aiCount}} AI-tagged`,
         `${{errorCount}} with export issues`,
@@ -1860,6 +1986,15 @@ def html_template(payload: dict[str, Any]) -> str:
       span.className = "tag";
       span.textContent = text;
       return span;
+    }}
+
+    function fileFormatLabel(entry) {{
+      return String(entry.fileFormat || "").toUpperCase();
+    }}
+
+    function bakedDownloadLabel(entry) {{
+      const formatLabel = fileFormatLabel(entry);
+      return formatLabel ? `Download ${{formatLabel}}` : "Download file";
     }}
 
     function makeCard(entry) {{
@@ -1908,8 +2043,12 @@ def html_template(payload: dict[str, Any]) -> str:
 
       const stats = document.createElement("div");
       stats.className = "stats";
-      stats.appendChild(makeTag(`${{entry.parameterCount}} parameters`));
-      stats.appendChild(makeTag(`${{entry.groupNames.length}} groups`));
+      if (entry.entryType === "scad") {{
+        stats.appendChild(makeTag(`${{entry.parameterCount}} parameters`));
+        stats.appendChild(makeTag(`${{entry.groupNames.length}} groups`));
+      }} else {{
+        stats.appendChild(makeTag(`${{fileFormatLabel(entry)}} baked file`));
+      }}
       content.appendChild(stats);
 
       const tags = document.createElement("div");
@@ -1936,7 +2075,7 @@ def html_template(payload: dict[str, Any]) -> str:
 
       const sourceLink = document.createElement("a");
       sourceLink.href = `${{payload.serverBasePath}}/source-file/${{entry.id}}`;
-      sourceLink.textContent = entry.entryType === "scad" ? "Open source" : "Download STL";
+      sourceLink.textContent = entry.entryType === "scad" ? "Open source" : bakedDownloadLabel(entry);
       actions.appendChild(sourceLink);
 
       if (entry.entryType === "scad") {{
@@ -2223,7 +2362,7 @@ def html_template(payload: dict[str, Any]) -> str:
     function setActiveTab(tab) {{
       activeTab = tab;
       tabScadBtn.classList.toggle("tab-active", tab === "scad");
-      tabStlBtn.classList.toggle("tab-active", tab === "stl");
+      tabBakedBtn.classList.toggle("tab-active", tab === "baked");
       applyFilters();
     }}
 
@@ -2362,7 +2501,6 @@ def html_template(payload: dict[str, Any]) -> str:
       return {{
         id: "",
         name: "",
-        type: "scad",
         path: "",
         libraryPaths: [],
         includeHelpers: false,
@@ -2544,7 +2682,7 @@ def html_template(payload: dict[str, Any]) -> str:
       const aiToggles = [
         ["enabled", "Enable AI enrichment at index time"],
         ["includeScad", "Allow AI enrichment for SCAD entries"],
-        ["includeStl", "Allow AI enrichment for STL entries"],
+        ["includeStl", "Allow AI enrichment for baked object entries (.stl, .3mf)"],
       ];
       for (const [key, labelText] of aiToggles) {{
         const wrapper = document.createElement("label");
@@ -2590,25 +2728,6 @@ def html_template(payload: dict[str, Any]) -> str:
           ["libraryPaths", "Library Paths", "text", (source.libraryPaths || []).join(", ")],
         ];
 
-        const typeField = document.createElement("div");
-        typeField.className = "field";
-        const typeLabel = document.createElement("label");
-        typeLabel.textContent = "Source Type";
-        typeField.appendChild(typeLabel);
-        const typeSelect = document.createElement("select");
-        for (const optionValue of ["scad", "stl"]) {{
-          const option = document.createElement("option");
-          option.value = optionValue;
-          option.textContent = optionValue === "scad" ? "Customizable SCAD" : "Baked STL";
-          option.selected = (source.type || "scad") === optionValue;
-          typeSelect.appendChild(option);
-        }}
-        typeSelect.addEventListener("change", () => {{
-          source.type = typeSelect.value;
-        }});
-        typeField.appendChild(typeSelect);
-        fields.appendChild(typeField);
-
         for (const [key, labelText, type, value] of definitions) {{
           const field = document.createElement("div");
           field.className = "field";
@@ -2637,6 +2756,12 @@ def html_template(payload: dict[str, Any]) -> str:
           }}
           fields.appendChild(field);
         }}
+
+        const scanHelp = document.createElement("div");
+        scanHelp.className = "small-note";
+        scanHelp.textContent =
+          "Each source folder is scanned for customizable .scad files and baked object files such as .stl and .3mf.";
+        fields.appendChild(scanHelp);
 
         const toggles = [
           ["includeHelpers", "Include helper files"],
@@ -2738,7 +2863,7 @@ def html_template(payload: dict[str, Any]) -> str:
     sourceSelect.addEventListener("change", applyFilters);
     categorySelect.addEventListener("change", applyFilters);
     tabScadBtn.addEventListener("click", () => setActiveTab("scad"));
-    tabStlBtn.addEventListener("click", () => setActiveTab("stl"));
+    tabBakedBtn.addEventListener("click", () => setActiveTab("baked"));
     renderPreviewBtn.addEventListener("click", renderCustomPreview);
     exportStlBtn.addEventListener("click", exportBinaryStl);
     openScadBtn.addEventListener("click", openInOpenScad);
