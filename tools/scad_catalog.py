@@ -2852,7 +2852,7 @@ def html_template(payload: dict[str, Any]) -> str:
       }}
       const progress = rescanProgressText(status);
       const detail = rescanDetailText(status);
-      updateSettingsStatus(detail ? `${{progress}} ${detail}` : progress, "");
+      updateSettingsStatus(detail ? `${{progress}} ${{detail}}` : progress, "");
     }}
 
     async function fetchRescanStatus() {{
