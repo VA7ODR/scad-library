@@ -1043,6 +1043,34 @@ def decode_scad_string_literal(value: str) -> str:
         return value
 
 
+def parse_scad_option_comment(comment_text: str) -> list[str]:
+    try:
+        parsed = json.loads(comment_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+        return [item for item in parsed if item]
+
+    text = comment_text.strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return []
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+
+    options: list[str] = []
+    for raw_part in inner.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {'"', "'"}:
+            part = part[1:-1]
+        part = part.strip()
+        if part and part not in options:
+            options.append(part)
+    return options
+
+
 def collect_string_parameter_comments(source_text: str) -> dict[str, list[str]]:
     option_map: dict[str, list[str]] = {}
     assignment_pattern = re.compile(
@@ -1055,13 +1083,9 @@ def collect_string_parameter_comments(source_text: str) -> dict[str, list[str]]:
         name, initial_text, comment_json = match.groups()
         if not comment_json:
             continue
-        options: list[str] = []
-        try:
-            parsed = json.loads(comment_json)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
-            options.extend(item for item in parsed if item)
+        options = parse_scad_option_comment(comment_json)
+        if not options:
+            continue
         initial_value = decode_scad_string_literal(initial_text)
         if initial_value and initial_value not in options:
             options.insert(0, initial_value)
@@ -1112,8 +1136,12 @@ def normalize_string_parameter_options(
             continue
 
         option_values = explicit_comment_options.get(name, [])
-        if not option_values:
-            option_values = collect_string_parameter_comparisons(source_text, name)
+        if len(option_values) < 2:
+            comparison_values = collect_string_parameter_comparisons(source_text, name)
+            for comparison_value in comparison_values:
+                if comparison_value not in option_values:
+                    option_values.append(comparison_value)
+        if len(option_values) < 2:
             initial_value = parameter.get("initial")
             if isinstance(initial_value, str) and initial_value and initial_value not in option_values:
                 option_values.insert(0, initial_value)
