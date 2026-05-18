@@ -1,6 +1,8 @@
 .catalog/
 .catalog-test/
 .local/
+.idea/
+SESSION-NOTES.md
 
 tools/__pycache__/
 *.pyc
