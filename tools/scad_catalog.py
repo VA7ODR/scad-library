@@ -26,7 +26,7 @@ DEFAULT_SLICER_BIN = ""
 HELPER_DIRS = {"Modules"}
 IN_PROGRESS_DIRS = {"InProgress"}
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct"
+DEFAULT_OLLAMA_MODEL = "scad-customizer"
 DEFAULT_AI_TIMEOUT = 30
 DEFAULT_AI_MAX_SOURCE_CHARS = 12000
 DEFAULT_AI_MAX_COMMENT_CHARS = 3000
@@ -2844,7 +2844,7 @@ def html_template(payload: dict[str, Any]) -> str:
         updateAssistantStatus(
           data.assistantUsed
             ? "Assistant suggestions are grounded in the local catalog and Ollama."
-            : "Assistant fell back to local catalog matching without Ollama ranking.",
+            : (data.assistantStatus || "Assistant fell back to local catalog matching without Ollama ranking."),
           data.assistantUsed ? "success" : ""
         );
       }} catch (error) {{

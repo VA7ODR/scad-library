@@ -32,7 +32,7 @@ DEFAULT_OPENSCAD_BIN = "openscad-nightly"
 DEFAULT_SLICER_BIN = ""
 DEFAULT_CONFIG_PATH = "sources.json"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "qwen3:4b-instruct"
+DEFAULT_OLLAMA_MODEL = "scad-customizer"
 DEFAULT_AI_TIMEOUT = 30
 SCAD_FILE_EXTENSION = ".scad"
 BAKED_FILE_EXTENSIONS = {".stl", ".3mf"}
@@ -364,6 +364,21 @@ def assistant_messages_from_payload(payload: dict[str, Any]) -> list[dict[str, s
     if not normalized:
         raise ValueError("Assistant request is missing any valid chat messages.")
     return normalized
+
+
+def assistant_fallback_status(
+    *,
+    ai_enabled: bool,
+    error_text: str = "",
+) -> str:
+    detail = error_text.lower()
+    if "timed out" in detail or "timeout" in detail:
+        return "Using local catalog matches because Ollama timed out."
+    if error_text:
+        return "Using local catalog matches because Ollama is unavailable right now."
+    if ai_enabled:
+        return "Using local catalog matches because Ollama did not return a trustworthy ranked answer."
+    return "Using local catalog matches without Ollama."
 
 
 def tokenize_search_text(text: str) -> list[str]:
@@ -1033,6 +1048,9 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             "followUp": "Open one of the customizable entries to review parameters and adjust dimensions.",
             "matches": top_matches,
             "assistantUsed": False,
+            "assistantStatus": assistant_fallback_status(
+                ai_enabled=bool(ai_state.get("enabled")),
+            ),
         }
 
     def resolve_ai_modelfile(self, modelfile: str) -> Path:
@@ -1256,6 +1274,10 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
                     candidates=candidates,
                     ai_state=ai_state,
                     current_tab=current_tab,
+                )
+                assistant_payload["assistantStatus"] = assistant_fallback_status(
+                    ai_enabled=bool(ai_state.get("enabled")),
+                    error_text=collapse_whitespace(str(exc)),
                 )
                 assistant_payload["reply"] = (
                     f"{assistant_payload['reply']} Ollama error: {collapse_whitespace(str(exc))[:220]}"
