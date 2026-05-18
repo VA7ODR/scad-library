@@ -1,4 +1,4 @@
-* scad-library
+# scad-library
 
 A local-first browser catalogue for OpenSCAD, STL, and 3MF libraries.
 
