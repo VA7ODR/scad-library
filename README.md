@@ -1,5 +1,7 @@
 # SCAD Catalog
 
+Your OpenSCAD library, searchable and printable — no cloud, no marketplace, no lock-in.
+
 `scad-catalog` is a local browser UI for OpenSCAD libraries and baked object folders.
 
 It can:
