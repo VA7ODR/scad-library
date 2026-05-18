@@ -1,8 +1,10 @@
-# SCAD Catalog
+#scad-library
 
-Your OpenSCAD library, searchable and printable — no cloud, no marketplace, no lock-in.
+A local-first browser catalogue for OpenSCAD, STL, and 3MF libraries.
 
-`scad-catalog` is a local browser UI for OpenSCAD libraries and baked object folders.
+Built for people who want to keep their printable model libraries on their own disk,
+preview and customize OpenSCAD files locally, and open finished models directly in
+their slicer without depending on hosted customizer platforms.
 
 It can:
 
