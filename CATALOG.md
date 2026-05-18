@@ -17,7 +17,7 @@ An optional top-level `ai` block can enable local Ollama enrichment during index
 - search terms
 - friendly parameter labels with the original SCAD variable names preserved in the UI
 
-If Ollama is disabled, offline, or missing the configured model, the catalog still builds normally without AI metadata.
+If Ollama is disabled, offline, or missing the configured model, the catalog still builds normally without AI metadata. If `ai.modelfile` is configured and Ollama is installed, the tool will try to create the missing model automatically with `ollama create`.
 
 ## Rendering
 

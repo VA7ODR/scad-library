@@ -275,10 +275,13 @@ def update_rescan_status(**updates: Any) -> None:
         RESCAN_STATUS.update(updates)
 
 
-def normalize_ai_text(value: Any, default: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+def normalize_ai_text(value: Any, default: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
         return default
-    return value.strip()
+    text = value.strip()
+    if not text and not allow_empty:
+        return default
+    return text
 
 
 def normalize_ai_timeout(value: Any, default: int) -> int:
@@ -321,6 +324,25 @@ def ollama_request(
     if not isinstance(parsed, dict):
         raise RuntimeError("Ollama returned an unexpected response payload.")
     return parsed
+
+
+def ollama_available_names(payload: dict[str, Any]) -> set[str]:
+    models = payload.get("models", [])
+    raw_names = {
+        item.get("name")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    raw_names.update(
+        item.get("model")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("model"), str)
+    )
+    available_names = {name for name in raw_names if isinstance(name, str) and name}
+    for name in list(available_names):
+        if name.endswith(":latest"):
+            available_names.add(name[: -len(":latest")])
+    return available_names
 
 
 def assistant_messages_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -674,6 +696,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             "provider": normalize_ai_text(raw_ai.get("provider"), "ollama"),
             "baseUrl": normalize_ai_text(raw_ai.get("baseUrl"), DEFAULT_OLLAMA_URL),
             "model": normalize_ai_text(raw_ai.get("model"), DEFAULT_OLLAMA_MODEL),
+            "modelfile": normalize_ai_text(raw_ai.get("modelfile"), "", allow_empty=True),
             "timeout": normalize_ai_timeout(raw_ai.get("timeout"), DEFAULT_AI_TIMEOUT),
         }
 
@@ -701,6 +724,8 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
                     not isinstance(ai_config[field], str) or not ai_config[field].strip()
                 ):
                     raise ValueError(f"AI config field '{field}' must be a non-empty string.")
+            if "modelfile" in ai_config and not isinstance(ai_config["modelfile"], str):
+                raise ValueError("AI config field 'modelfile' must be a string.")
             bool_fields = ("enabled", "includeScad", "includeStl")
             for field in bool_fields:
                 if field in ai_config and not isinstance(ai_config[field], bool):
@@ -890,11 +915,11 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
         )
 
     def handle_rescan_status(self) -> None:
-        self.send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "status": current_rescan_status(),
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": current_rescan_status(),
             },
         )
 
@@ -1009,6 +1034,61 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             "matches": top_matches,
             "assistantUsed": False,
         }
+
+    def resolve_ai_modelfile(self, modelfile: str) -> Path:
+        path = Path(modelfile).expanduser()
+        if not path.is_absolute():
+            path = self.workspace_root / path
+        return path.resolve()
+
+    def ensure_ollama_model(self, ai_state: dict[str, Any]) -> None:
+        payload = ollama_request(
+            base_url=ai_state["baseUrl"],
+            timeout_seconds=ai_state["timeout"],
+            endpoint="/api/tags",
+            method="GET",
+        )
+        available_names = ollama_available_names(payload)
+        if ai_state["model"] in available_names:
+            return
+
+        modelfile_text = str(ai_state.get("modelfile") or "").strip()
+        if not modelfile_text:
+            raise RuntimeError(f"model '{ai_state['model']}' is not available in local Ollama")
+        modelfile_path = self.resolve_ai_modelfile(modelfile_text)
+        if not modelfile_path.exists():
+            raise RuntimeError(f"Modelfile does not exist: {modelfile_path}")
+        ollama_bin = shutil.which("ollama")
+        if not ollama_bin:
+            raise RuntimeError("Ollama CLI is not installed")
+        timeout_seconds = max(1800, int(ai_state["timeout"]) * 60)
+        try:
+            result = subprocess.run(
+                [ollama_bin, "create", ai_state["model"], "-f", str(modelfile_path)],
+                cwd=self.workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                collapse_whitespace(str(exc)) or "automatic Ollama model creation failed"
+            ) from exc
+        if result.returncode != 0:
+            detail = collapse_whitespace(result.stderr or result.stdout or "")[:240]
+            raise RuntimeError(detail or f"ollama create exited with code {result.returncode}")
+
+        payload = ollama_request(
+            base_url=ai_state["baseUrl"],
+            timeout_seconds=ai_state["timeout"],
+            endpoint="/api/tags",
+            method="GET",
+        )
+        if ai_state["model"] not in ollama_available_names(payload):
+            raise RuntimeError(
+                f"model '{ai_state['model']}' is still unavailable after automatic creation"
+            )
 
     def ollama_assistant_reply(
         self,
@@ -1144,6 +1224,7 @@ class CatalogRequestHandler(SimpleHTTPRequestHandler):
             )
             candidates = self.assistant_candidates(query=latest_user_message, current_tab=current_tab)
             if ai_state["enabled"] and ai_state["provider"] == "ollama":
+                self.ensure_ollama_model(ai_state)
                 assistant_payload = self.ollama_assistant_reply(
                     messages=messages,
                     candidates=candidates,

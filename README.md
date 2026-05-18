@@ -66,7 +66,8 @@ Example:
     "enabled": false,
     "provider": "ollama",
     "baseUrl": "http://127.0.0.1:11434",
-    "model": "qwen3:4b-instruct",
+    "model": "scad-customizer",
+    "modelfile": "models/Modelfile.scad-customizer",
     "timeout": 30,
     "includeScad": true,
     "includeStl": false,
@@ -116,14 +117,15 @@ AI fields:
 - `enabled`: turn local AI enrichment on or off
 - `provider`: currently `ollama`
 - `baseUrl`: Ollama API base URL
-- `model`: local model name such as `qwen3:4b-instruct`
+- `model`: local model name such as `scad-customizer`
+- `modelfile`: optional Ollama Modelfile path used to auto-create the named model if it is missing
 - `timeout`: request timeout in seconds
 - `includeScad`: allow AI summaries/tags/parameter labels for SCAD entries
 - `includeStl`: allow AI summaries/tags for baked object entries such as STL and 3MF
 - `maxSourceChars`: max source excerpt sent to Ollama per SCAD file
 - `maxCommentChars`: max leading comment text sent to Ollama per SCAD file
 
-If AI is enabled but Ollama is not running or the model is unavailable, catalog generation falls back to the current non-AI behavior.
+If AI is enabled but Ollama is not running or the model is unavailable, catalog generation falls back to the current non-AI behavior. If `modelfile` is set and Ollama is installed, the tool will try to create the missing model automatically with `ollama create`.
 
 ## Build the catalog
 

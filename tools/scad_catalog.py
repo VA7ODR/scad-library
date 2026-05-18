@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class AIConfig:
     provider: str
     base_url: str
     model: str
+    modelfile: str | None
     timeout_seconds: int
     include_scad: bool
     include_stl: bool
@@ -349,6 +351,12 @@ def load_ai_config(payload: dict[str, Any], args: argparse.Namespace) -> AIConfi
     if not isinstance(model, str) or not model.strip():
         raise SystemExit("AI config field 'model' must be a non-empty string.")
 
+    modelfile = raw_ai.get("modelfile")
+    if modelfile is not None:
+        if not isinstance(modelfile, str):
+            raise SystemExit("AI config field 'modelfile' must be a string when present.")
+        modelfile = modelfile.strip() or None
+
     timeout_seconds = parse_positive_int(
         args.ai_timeout if args.ai_timeout is not None else raw_ai.get("timeout"),
         field_name="timeout",
@@ -376,6 +384,7 @@ def load_ai_config(payload: dict[str, Any], args: argparse.Namespace) -> AIConfi
         provider=provider,
         base_url=base_url.rstrip("/"),
         model=model.strip(),
+        modelfile=modelfile,
         timeout_seconds=timeout_seconds,
         include_scad=parse_bool(raw_ai.get("includeScad"), field_name="includeScad", default=True),
         include_stl=parse_bool(raw_ai.get("includeStl"), field_name="includeStl", default=False),
@@ -606,6 +615,66 @@ def ollama_request(
     return parsed
 
 
+def ollama_available_names(payload: dict[str, Any]) -> set[str]:
+    models = payload.get("models", [])
+    raw_names = {
+        item.get("name")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    raw_names.update(
+        item.get("model")
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("model"), str)
+    )
+    available_names = {name for name in raw_names if isinstance(name, str) and name}
+    for name in list(available_names):
+        if name.endswith(":latest"):
+            available_names.add(name[: -len(":latest")])
+    return available_names
+
+
+def resolve_ai_modelfile(modelfile: str | None, workspace_root: Path) -> Path | None:
+    if not modelfile:
+        return None
+    path = Path(modelfile).expanduser()
+    if not path.is_absolute():
+        path = workspace_root / path
+    return path.resolve()
+
+
+def bootstrap_ollama_model(
+    ai_config: AIConfig,
+    *,
+    workspace_root: Path,
+) -> str | None:
+    modelfile_path = resolve_ai_modelfile(ai_config.modelfile, workspace_root)
+    if modelfile_path is None:
+        return "no Modelfile configured for automatic Ollama model creation"
+    if not modelfile_path.exists():
+        return f"Modelfile does not exist: {modelfile_path}"
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        return "Ollama CLI is not installed"
+    timeout_seconds = max(1800, ai_config.timeout_seconds * 60)
+    try:
+        result = subprocess.run(
+            [ollama_bin, "create", ai_config.model, "-f", str(modelfile_path)],
+            cwd=workspace_root,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return collapse_whitespace(str(exc)) or "automatic Ollama model creation failed"
+    if result.returncode != 0:
+        return collapse_whitespace(result.stderr or result.stdout or "")[:240] or (
+            f"ollama create exited with code {result.returncode}"
+        )
+    return None
+
+
 def probe_ai(ai_config: AIConfig) -> AIState:
     if not ai_config.enabled:
         return AIState(
@@ -638,25 +707,40 @@ def probe_ai(ai_config: AIConfig) -> AIState:
             reason=f"Ollama unavailable at {ai_config.base_url}: {exc}",
         )
 
-    models = payload.get("models", [])
-    available_names = {
-        item.get("name")
-        for item in models
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    available_names.update(
-        item.get("model")
-        for item in models
-        if isinstance(item, dict) and isinstance(item.get("model"), str)
-    )
+    available_names = ollama_available_names(payload)
     if ai_config.model not in available_names:
+        bootstrap_error = bootstrap_ollama_model(ai_config, workspace_root=Path.cwd())
+        if bootstrap_error is None:
+            try:
+                payload = ollama_request(ai_config, "/api/tags", method="GET")
+                available_names = ollama_available_names(payload)
+            except RuntimeError as exc:
+                return AIState(
+                    enabled=True,
+                    available=False,
+                    provider=ai_config.provider,
+                    base_url=ai_config.base_url,
+                    model=ai_config.model,
+                    reason=f"model bootstrap succeeded but Ollama recheck failed: {exc}",
+                )
+        if ai_config.model in available_names:
+            return AIState(
+                enabled=True,
+                available=True,
+                provider=ai_config.provider,
+                base_url=ai_config.base_url,
+                model=ai_config.model,
+            )
         return AIState(
             enabled=True,
             available=False,
             provider=ai_config.provider,
             base_url=ai_config.base_url,
             model=ai_config.model,
-            reason=f"model '{ai_config.model}' is not available in local Ollama",
+            reason=(
+                f"model '{ai_config.model}' is not available in local Ollama"
+                + (f"; auto-create failed: {bootstrap_error}" if bootstrap_error else "")
+            ),
         )
 
     return AIState(
@@ -1652,6 +1736,9 @@ def html_template(payload: dict[str, Any]) -> str:
       border-radius: 1.2rem;
       padding: 0;
       background: transparent;
+    }}
+    [hidden] {{
+      display: none !important;
     }}
     dialog::backdrop {{
       background: rgba(16, 12, 7, 0.45);
@@ -2861,7 +2948,8 @@ def html_template(payload: dict[str, Any]) -> str:
     function renderScanIndicator(status = rescanStatus) {{
       const active = Boolean(status?.active);
       scanIndicator.hidden = !active;
-      scanIndicatorText.textContent = active ? rescanProgressText(status) : "Scan running...";
+      scanIndicator.style.display = active ? "inline-flex" : "none";
+      scanIndicatorText.textContent = active ? rescanProgressText(status) : "";
       saveRescanBtn.disabled = active;
       saveForceRescanBtn.disabled = active;
     }}
@@ -3084,7 +3172,8 @@ def html_template(payload: dict[str, Any]) -> str:
         enabled: false,
         provider: "ollama",
         baseUrl: "http://127.0.0.1:11434",
-        model: "qwen3:4b-instruct",
+        model: "scad-customizer",
+        modelfile: "models/Modelfile.scad-customizer",
         timeout: 30,
         includeScad: true,
         includeStl: false,
@@ -3213,7 +3302,8 @@ def html_template(payload: dict[str, Any]) -> str:
       const aiTextFields = [
         ["provider", "Provider", editableConfig.ai.provider || "ollama"],
         ["baseUrl", "Base URL", editableConfig.ai.baseUrl || "http://127.0.0.1:11434"],
-        ["model", "Model", editableConfig.ai.model || "qwen3:4b-instruct"],
+        ["model", "Model", editableConfig.ai.model || "scad-customizer"],
+        ["modelfile", "Modelfile", editableConfig.ai.modelfile || "models/Modelfile.scad-customizer"],
         ["timeout", "Timeout Seconds", String(editableConfig.ai.timeout ?? 30)],
         ["maxSourceChars", "Max Source Chars", String(editableConfig.ai.maxSourceChars ?? 12000)],
         ["maxCommentChars", "Max Comment Chars", String(editableConfig.ai.maxCommentChars ?? 3000)],
@@ -3266,7 +3356,7 @@ def html_template(payload: dict[str, Any]) -> str:
       const aiHelp = document.createElement("div");
       aiHelp.className = "small-note";
       aiHelp.textContent =
-        "AI enrichment is optional. If Ollama is disabled, missing, or the model is unavailable, indexing falls back to the normal non-AI behavior.";
+        "AI enrichment is optional. If Ollama is disabled, missing, or the model is unavailable, indexing falls back to the normal non-AI behavior. If a Modelfile is set and the named model is missing, the catalog can try to create it automatically with Ollama.";
       aiFields.appendChild(aiHelp);
       aiCard.appendChild(aiFields);
       settingsList.appendChild(aiCard);
